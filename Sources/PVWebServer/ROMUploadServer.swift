@@ -66,14 +66,28 @@ final class ROMUploadServer: @unchecked Sendable {
 
     // MARK: - Configuration
 
-    /// Ports tried in order until one binds. Port 80 keeps the URL short on device.
+    /// Default ports, tried in order until one binds. Port 80 keeps the URL short on device.
+    /// Apps sharing a device with other servers should set `preferredPorts` instead.
     #if targetEnvironment(simulator)
-    static let preferredPorts: [UInt16] = [8080, 8000, 8888, 9000]
+    static let defaultPorts: [UInt16] = [8080, 8000, 8888, 9000]
     #else
-    static let preferredPorts: [UInt16] = [80, 8080, 8000, 8888, 9000]
+    static let defaultPorts: [UInt16] = [80, 8080, 8000, 8888, 9000]
     #endif
+    private var _preferredPorts: [UInt16] = ROMUploadServer.defaultPorts
+    /// Ports tried in order by the next `start()`. Set before starting: iFly, iCube and
+    /// Provenance can run on one device, and whoever binds first owns a port, so each
+    /// app keeps its own home port and a fallback range that avoids the others'.
+    var preferredPorts: [UInt16] {
+        get { lock.lock(); defer { lock.unlock() }; return _preferredPorts }
+        set { lock.lock(); _preferredPorts = newValue.isEmpty ? Self.defaultPorts : newValue; lock.unlock() }
+    }
     /// The port the listener bound, 0 while stopped.
     private(set) var port: UInt16 = 0
+    /// The port the listener holds right now: 0 unless it is `.ready`.
+    var boundPort: UInt16 {
+        lock.lock(); defer { lock.unlock() }
+        return isRunningUnlocked ? port : 0
+    }
     /// A socket that connects but never delivers a request within this window is cancelled
     /// so `mount_webdav` retries on a fresh connection instead of hanging.
     private static let firstRequestGraceSeconds: TimeInterval = 12
@@ -233,7 +247,7 @@ final class ROMUploadServer: @unchecked Sendable {
         defer { endStarting() }
 
         var lastError: Error?
-        for candidate in Self.preferredPorts {
+        for candidate in preferredPorts {
             do {
                 try await startListener(on: candidate)
                 advertiseWebDAV(on: candidate)

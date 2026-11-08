@@ -186,6 +186,18 @@ public final class PVWebServer: NSObject, @unchecked Sendable {
     @objc(URL)
     public var url: URL? { server.serverURL }
 
+    /// The port the listener holds right now, or 0 while it is down. Read this, not
+    /// `url?.port`, which is nil for `http://ip/` (port 80).
+    @objc public var port: Int { Int(server.boundPort) }
+
+    /// Ports the next start tries, in order (HTTP and WebDAV share one listener). Set it
+    /// before the first start. Empty restores the defaults (80, 8080, 8000, 8888, 9000 on
+    /// device). Ports outside 1...65535 are dropped.
+    @objc public var preferredPorts: [Int] {
+        get { server.preferredPorts.map(Int.init) }
+        set { server.preferredPorts = newValue.compactMap { (1...65_535).contains($0) ? UInt16($0) : nil } }
+    }
+
     /// Bonjour-advertised server URL once registration completes, or nil.
     /// (Historical property name keeps the original "Sever" misspelling so the
     /// `PVWebServer.shared.bonjourSeverURL` call site in SourcesView still
