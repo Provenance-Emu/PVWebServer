@@ -216,6 +216,57 @@ final class WebServerConfigurationTests: XCTestCase {
         await fulfillment(of: [gone], timeout: 10)
     }
 
+    // MARK: Overlapping starts
+
+    private func makeServer(ports: [Int]) -> PVWebServer {
+        PVWebServer(configuration: WebServerConfiguration(
+            rootDirectory: root,
+            pageTitle: "Test",
+            bonjourName: "Test \(UUID().uuidString.prefix(8))",
+            preferredPorts: ports
+        ))
+    }
+
+    /// What each caller saw the moment its `start()` returned.
+    private func startConcurrently(_ server: PVWebServer, callers: Int) async -> [Result<Int, Error>] {
+        await withTaskGroup(of: Result<Int, Error>.self) { group in
+            for _ in 0..<callers {
+                group.addTask {
+                    do {
+                        try await server.start()
+                        return .success(server.isRunning ? Int(server.port) : 0)
+                    } catch {
+                        return .failure(error)
+                    }
+                }
+            }
+            return await group.reduce(into: []) { $0.append($1) }
+        }
+    }
+
+    func testOverlappingStartsAllReturnOnceTheListenerIsReady() async throws {
+        let base = 46_000 + Int.random(in: 0..<4_000)
+        server = makeServer(ports: [base, base + 1, base + 2])
+        let results = await startConcurrently(server, callers: 4)
+        let ports = try results.map { try $0.get() }
+        XCTAssertEqual(Set(ports).count, 1, "every caller sees the one listener: \(ports)")
+        XCTAssertNotEqual(ports.first, 0, "no caller returns before the listener is ready")
+    }
+
+    func testOverlappingStartsAllThrowWhenNoPortBinds() async throws {
+        let base = 46_000 + Int.random(in: 0..<4_000)
+        let holder = makeServer(ports: [base])
+        try await holder.start()
+        defer { holder.stopServers() }
+
+        server = makeServer(ports: [base])
+        let results = await startConcurrently(server, callers: 3)
+        for result in results {
+            if case .success(let port) = result { XCTFail("a caller returned success on port \(port)") }
+        }
+        XCTAssertFalse(server.isRunning)
+    }
+
     // MARK: Unexpected stop
 
     /// iOS killing the socket of a suspended app looks like this to the server.
