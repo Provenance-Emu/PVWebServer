@@ -9,12 +9,33 @@ The host supplies the served directory and registers any application routes.
 
 Run `swift test` for the server policy, route and filesystem tests.
 
-## Consumer migration
+## Using it from an app
 
-This package preserves iCube’s API. Provenance currently has a different package
-also named PVWebServer, with ObjC/GCDWebServer and Hummingbird products. Do not
-replace that dependency without porting its callers first. A graph cannot contain
-both packages under the same identity.
+`PVWebServer.shared` is iCube's server: it serves iCube's library folder and asks
+for a library rescan after each upload. Any other app creates its own:
+
+```swift
+let server = PVWebServer(configuration: WebServerConfiguration(
+    rootDirectory: documents,
+    defaultUploadDirectory: documents.appendingPathComponent("Imports"),
+    pageTitle: "Provenance",
+    preferredPorts: [8080, 8180, 8181],
+    reportsWebDAVMovesAsUploads: false
+))
+server.setUnexpectedStopHandler { /* iOS closed the socket; start again */ }
+try await server.start()
+```
+
+HTTP and WebDAV share one port. Routes added with `addAsyncHandler` run before the
+built-in ones, so `GET /` can replace the upload page. They match exact paths, so
+a route takes its subject from the query string; check it with
+`WebServerPathSafety.resolve`. Bodies are `.data`, `.file` (read from disk at an
+offset) or `.stream` (open-ended, such as Server-Sent Events).
+
+To follow what clients do, observe `PVWebServerFileUploadCompletedNotificationName`,
+`PVWebServerFileDeletedNotificationName`, `PVWebServerFileMovedNotificationName` and
+`PVWebServerFolderCreatedNotificationName`. They fire for the browser page and for
+WebDAV alike.
 
 The original GPL-2.0-or-later source notices are retained; see COPYING.
 

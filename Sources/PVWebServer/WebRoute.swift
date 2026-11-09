@@ -80,6 +80,22 @@ public struct WebRouteRequest: Sendable {
 
 // MARK: - Response
 
+/// Sends the body of a `.stream` response.
+public struct WebRouteStreamWriter: Sendable {
+    private let send: @Sendable (Data) async -> Bool
+
+    init(send: @escaping @Sendable (Data) async -> Bool) {
+        self.send = send
+    }
+
+    /// Returns `false` once the client is gone. A dead client only shows up on a write, so a
+    /// stream that can sit idle should send a keep-alive now and then to notice it.
+    @discardableResult
+    public func write(_ data: Data) async -> Bool {
+        await send(data)
+    }
+}
+
 public struct WebRouteResponse: Sendable {
     /// Bodies are either in memory (JSON, small payloads) or a reference to a
     /// file the server streams from disk. Game files run to gigabytes and must
@@ -89,6 +105,9 @@ public struct WebRouteResponse: Sendable {
         case data(Data)
         /// `length == nil` means "to the end of the file".
         case file(url: URL, offset: Int64, length: Int64?)
+        /// An open-ended response, such as Server-Sent Events. The closure writes until it is
+        /// done or a write returns `false`, and the connection closes when it returns.
+        case stream(@Sendable (WebRouteStreamWriter) async -> Void)
     }
 
     public var status: Int
@@ -125,6 +144,7 @@ public struct WebRouteResponse: Sendable {
     public static func reasonPhrase(for status: Int) -> String {
         switch status {
         case 200: return "OK"
+        case 201: return "Created"
         case 202: return "Accepted"
         case 204: return "No Content"
         case 206: return "Partial Content"
@@ -133,6 +153,7 @@ public struct WebRouteResponse: Sendable {
         case 401: return "Unauthorized"
         case 403: return "Forbidden"
         case 404: return "Not Found"
+        case 409: return "Conflict"
         case 410: return "Gone"
         case 413: return "Request Entity Too Large"
         case 416: return "Range Not Satisfiable"

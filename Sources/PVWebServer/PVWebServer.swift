@@ -46,6 +46,15 @@ public let PVWebServerUserAccessRequestedNotificationName = "PVWebServerUserAcce
 public let PVWebServerUserAccessReleasedNotificationName = "PVWebServerUserAccessReleasedNotification"
 /// Posted when a file upload completes. userInfo: ["filePath": String, "fileSize": UInt64].
 public let PVWebServerFileUploadCompletedNotificationName = "PVWebServerFileUploadCompletedNotification"
+/// Posted after a client deletes a file or folder (browser UI or WebDAV).
+/// userInfo: ["filePath": String], absolute path of what was deleted.
+public let PVWebServerFileDeletedNotificationName = "PVWebServerFileDeletedNotification"
+/// Posted after a client moves or renames a file or folder (browser UI or WebDAV).
+/// userInfo: ["fromPath": String, "toPath": String], both absolute.
+public let PVWebServerFileMovedNotificationName = "PVWebServerFileMovedNotification"
+/// Posted after a client creates a folder (browser UI or WebDAV).
+/// userInfo: ["filePath": String], absolute path of the new folder.
+public let PVWebServerFolderCreatedNotificationName = "PVWebServerFolderCreatedNotification"
 
 /// ObjC-visible Notification.Name accessors (kept for any ObjC observers that
 /// referenced the old `extern NSString* const` symbols).
@@ -66,7 +75,7 @@ public final class PVWebServer: NSObject, @unchecked Sendable {
 
     // MARK: Engine
 
-    private let server: ROMUploadServer
+    let server: ROMUploadServer
     private var rescanWorkItem: DispatchWorkItem?
     private var pendingUploadCount = 0
     /// Uploads that have posted Started but not yet Completed. A WebDAV copy is several
@@ -88,18 +97,34 @@ public final class PVWebServer: NSObject, @unchecked Sendable {
 
     // MARK: Init
 
-    private override init() {
-        self.server = ROMUploadServer(romsDirectory: PVWebServer.uploadRootDirectory())
+    /// iCube's server: the `shared` instance, serving the library scanner's folder.
+    private override convenience init() {
+        self.init(configuration: WebServerConfiguration(
+            rootDirectory: PVWebServer.uploadRootDirectory(),
+            bridgesUploadsToLibraryRescan: true
+        ))
+    }
+
+    /// A server for an app that decides its own folder, names and ports. Nothing runs until
+    /// `start()`. Routes added with `addAsyncHandler` survive stop and start.
+    public init(configuration: WebServerConfiguration) {
+        self.server = ROMUploadServer(romsDirectory: configuration.rootDirectory)
         super.init()
 
         // Title shown on the upload web page.
-        let title = (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+        let title = configuration.pageTitle
+            ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
             ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String)
             ?? "iCube"
         self.server.pageTitle = title
         // Unique per device so two iCubes on one LAN do not collide on the Bonjour name.
         let host = ProcessInfo.processInfo.hostName.replacingOccurrences(of: ".local", with: "")
-        self.server.bonjourName = host.isEmpty ? title : "\(title) (\(host))"
+        self.server.bonjourName = configuration.bonjourName ?? (host.isEmpty ? title : "\(title) (\(host))")
+        self.server.defaultUploadDirectory = configuration.defaultUploadDirectory
+        self.server.reportsWebDAVMovesAsUploads = configuration.reportsWebDAVMovesAsUploads
+        self.preferredPorts = configuration.preferredPorts
+
+        guard configuration.bridgesUploadsToLibraryRescan else { return }
 
         // Bridge upload completion → library rescan + toast.
         NotificationCenter.default.addObserver(
@@ -133,6 +158,25 @@ public final class PVWebServer: NSObject, @unchecked Sendable {
         let base = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0]
         #endif
         return URL(fileURLWithPath: base).appendingPathComponent("Software")
+    }
+
+    // MARK: - Lifecycle
+
+    /// Binds the first free port in `preferredPorts` and returns once the listener is ready.
+    /// Throws if none binds. Does nothing if the server is already up.
+    public func start() async throws {
+        try await server.start()
+    }
+
+    /// Whether the listener is up. Also covers WebDAV, which shares it.
+    public var isRunning: Bool { server.isRunning }
+
+    /// Called when a running listener dies without `stopServers()`, which is what iOS does to
+    /// the sockets of a suspended app. The server has already stopped itself and withdrawn its
+    /// Bonjour records; call `start()` to come back, possibly on another port. Runs on a
+    /// private queue.
+    public func setUnexpectedStopHandler(_ handler: (@Sendable () -> Void)?) {
+        server.unexpectedStopHandler = handler
     }
 
     // MARK: - Public ObjC API (legacy surface)
