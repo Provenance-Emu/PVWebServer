@@ -37,6 +37,27 @@ To follow what clients do, observe `PVWebServerFileUploadCompletedNotificationNa
 `PVWebServerFolderCreatedNotificationName`. They fire for the browser page and for
 WebDAV alike.
 
+### Fitting the server to an app
+
+More options on `WebServerConfiguration`, all off or unchanged by default:
+
+- `uploadPageRenderer` draws `GET /` from the app's own templates and keeps the
+  folder listing the server builds.
+- `uploadTransferObserver` sees the bytes of each upload reaching disk.
+- `preservesMultipartSubfolders` keeps the sender's folder path in a browser upload.
+  Games that need their CHDs in a set folder rely on this.
+- `advertisesWebDAVService` turns off the `_webdav._tcp` record when the app publishes
+  its own. `setBonjourRegistrationHandler(_:)` reports the name mDNS really registered.
+
+`addAsyncHandler(forMethod:pathPrefix:handler:)` matches every path below a prefix,
+for routes whose last segment is their subject. Exact routes win.
+`WebServerLog.setHandler(_:)` sends the log lines to the app's logger, and
+`seedCachedIPAddress(_:)` saves the first `ipAddress` a walk of the interfaces.
+
+Routes see `//api/x` as `/api/x`: iOS and tvOS 18 NSURL produce that path when joining
+onto a base URL ending in a slash. Routes run for WebDAV clients too, so an app can
+put access control in a route. The WebDAV file layer itself allows anonymous access.
+
 The original GPL-2.0-or-later source notices are retained; see COPYING.
 
 ## Precompiled XCFramework
