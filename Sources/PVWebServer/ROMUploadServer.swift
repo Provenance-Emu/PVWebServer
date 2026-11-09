@@ -166,8 +166,9 @@ final class ROMUploadServer: @unchecked Sendable {
     /// delegate method — see the 5s self-check in `advertiseWebDAV`.
     private var bonjourPublishConfirmed = false
     #endif
-    /// Guards `start()` against a second concurrent call while the port-fallback loop is running.
-    private var isStarting = false
+    /// The port-fallback loop in progress, if any. A `start()` that arrives meanwhile awaits it
+    /// rather than binding a second listener, and gets its result.
+    private var startTask: Task<Void, Error>?
     /// How long a single port bind may sit without reaching `.ready` before it is abandoned.
     /// Long enough for the user to answer the Local Network permission prompt on first launch.
     private static let bindTimeout: TimeInterval = 15
@@ -212,16 +213,22 @@ final class ROMUploadServer: @unchecked Sendable {
     /// Synchronous helpers so `start()` (an `async` function) never calls `NSLock.lock()`/
     /// `unlock()` directly from its own body — those are `noasync` and warn (error in Swift 6
     /// mode) when called straight from an async context, even in a `defer`.
-    private func beginStartingIfNeeded() -> Bool {
+    /// The start to await: the one in progress, or a new one. `nil` when already running.
+    private func startInProgressOrBegin() -> Task<Void, Error>? {
         lock.lock(); defer { lock.unlock() }
-        guard !isRunningUnlocked, !isStarting else { return false }
-        isStarting = true
-        return true
+        if isRunningUnlocked { return nil }
+        if let startTask { return startTask }
+        let task = Task {
+            defer { self.endStarting() }
+            try await self.bindFirstAvailablePort()
+        }
+        startTask = task
+        return task
     }
 
     private func endStarting() {
         lock.lock(); defer { lock.unlock() }
-        isStarting = false
+        startTask = nil
     }
 
     var serverURL: URL? {
@@ -256,10 +263,14 @@ final class ROMUploadServer: @unchecked Sendable {
     /// Bind one listener on the first free port in `preferredPorts` and wait for `.ready`.
     /// Advertises `_http._tcp` through the listener and `_webdav._tcp` through NetService on
     /// the same name and port; mDNSResponder coalesces them.
+    ///
+    /// Callers that overlap share one bind: each returns once the listener is ready, or throws
+    /// the same error if no port binds.
     func start() async throws {
-        guard beginStartingIfNeeded() else { return }
-        defer { endStarting() }
+        try await startInProgressOrBegin()?.value
+    }
 
+    private func bindFirstAvailablePort() async throws {
         var lastError: Error?
         for candidate in preferredPorts {
             do {
@@ -331,8 +342,8 @@ final class ROMUploadServer: @unchecked Sendable {
             }
             listener.start(queue: self.listenerQueue)
             // A listener that never reaches `.ready` or `.failed` (stuck in `.waiting`, or no
-            // callback at all) used to suspend this continuation forever, which left `isStarting`
-            // set and made every later `start()` a silent no-op for the rest of the session — the
+            // callback at all) used to suspend this continuation forever, which left the start
+            // in progress and made every later `start()` a silent no-op for the rest of the session — the
             // "Upload via Wi-Fi does nothing" bug. Bound the wait so the port loop moves on and a
             // later user request can try again.
             self.listenerQueue.asyncAfter(deadline: .now() + Self.bindTimeout) { [weak listener] in
