@@ -268,9 +268,15 @@ struct WebRouteTable: Sendable {
             return exact.handler
         }
         return prefixEntries
-            .filter { $0.method == normalizedMethod && normalizedPath.hasPrefix($0.path + "/") }
+            .filter { $0.method == normalizedMethod && Self.path(normalizedPath, isBelow: $0.path) }
             .max { $0.path.count < $1.path.count }?
             .handler
+    }
+
+    /// Matches on a segment boundary. The root is its own case: normalizing keeps its slash, so
+    /// appending one more would only match paths that start with `//`.
+    private static func path(_ path: String, isBelow prefix: String) -> Bool {
+        prefix == "/" ? path.count > 1 : path.hasPrefix(prefix + "/")
     }
 
     /// True when any method is registered at this path. Lets the server answer

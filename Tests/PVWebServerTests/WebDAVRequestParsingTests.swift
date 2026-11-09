@@ -97,6 +97,18 @@ final class WebRouteTablePrefixTests: XCTestCase {
         XCTAssertNil(wrongMethod)
     }
 
+    func testRootPrefixMatchesEverythingBelowTheRoot() async {
+        var table = WebRouteTable()
+        table.register(method: "GET", pathPrefix: "/", handler: tagged("root"))
+        table.register(method: "GET", pathPrefix: "/api", handler: tagged("api"))
+        let below = await route(table, "/status")
+        let deeper = await route(table, "/api/x")
+        let itself = await route(table, "/")
+        XCTAssertEqual(below, "root")
+        XCTAssertEqual(deeper, "api", "a longer prefix still wins")
+        XCTAssertNil(itself, "a prefix never matches itself")
+    }
+
     func testExactBeatsPrefixInEitherOrder() async {
         var table = WebRouteTable()
         table.register(method: "GET", pathPrefix: "/api", handler: tagged("prefix"))

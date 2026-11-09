@@ -3429,8 +3429,15 @@ final class StreamingMultipartParser: @unchecked Sendable {
                         state = .readingBody
                         continue
                     }
+                    // The sanitizer only sees the name. This also refuses a symlink inside the
+                    // upload folder, as a parent or as the file itself, that points outside it.
+                    guard case let .ok(filePath) = WebServerPathSafety.resolve(sanitized, within: outputDirectory) else {
+                        WebServerLog.log(.warning, "multipart: refused \(sanitized), it resolves outside the upload folder")
+                        currentFilename = nil
+                        state = .readingBody
+                        continue
+                    }
                     currentFilename = sanitized
-                    let filePath = outputDirectory.appendingPathComponent(sanitized)
                     currentFilePath = filePath
                     try? FileManager.default.createDirectory(at: filePath.deletingLastPathComponent(),
                                                              withIntermediateDirectories: true)
