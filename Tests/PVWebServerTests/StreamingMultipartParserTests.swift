@@ -45,6 +45,22 @@ final class StreamingMultipartParserTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("Wii/game.rvz").path))
     }
 
+    func testSubfolderPreservedWhenAsked() throws {
+        let parser = StreamingMultipartParser(preservesSubfolders: true, boundary: "B1", outputDirectory: dir)
+        parser.feed(multipart(boundary: "B1", filename: "meltybld/gdl-0028c.chd", body: Data("x".utf8)))
+        finalize(parser)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("meltybld/gdl-0028c.chd").path))
+    }
+
+    func testTraversalIsRefusedWhenPreservingSubfolders() throws {
+        let parser = StreamingMultipartParser(preservesSubfolders: true, boundary: "B2", outputDirectory: dir)
+        parser.feed(multipart(boundary: "B2", filename: "a/../../escape.bin", body: Data("x".utf8)))
+        finalize(parser)
+        XCTAssertTrue(parser.completedFiles.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dir.deletingLastPathComponent().appendingPathComponent("escape.bin").path))
+    }
+
     func testTraversalFilenameNotWrittenOutsideDir() throws {
         let parser = StreamingMultipartParser(boundary: "B2", outputDirectory: dir)
         parser.feed(multipart(boundary: "B2", filename: "../escape.bin", body: Data("x".utf8)))
