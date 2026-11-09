@@ -146,12 +146,14 @@ final class ROMUploadServer: @unchecked Sendable {
     }()
 
     private var listener: NWListener?
+    #if !os(watchOS)
     private var bonjourWebDAV: NetService?
     private let bonjourDelegate = WebDAVBonjourDelegate()
     /// Set once `netServiceDidPublish` actually fires for the current `bonjourWebDAV`.
     /// `NetService.publish()` can fail to schedule at all and never call back either
     /// delegate method — see the 5s self-check in `advertiseWebDAV`.
     private var bonjourPublishConfirmed = false
+    #endif
     /// Guards `start()` against a second concurrent call while the port-fallback loop is running.
     private var isStarting = false
     /// How long a single port bind may sit without reaching `.ready` before it is abandoned.
@@ -324,6 +326,8 @@ final class ROMUploadServer: @unchecked Sendable {
     }
 
     private func advertiseWebDAV(on candidate: UInt16) {
+        // watchOS advertises HTTP through NWListener. NetService is unavailable there.
+        #if !os(watchOS)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             // `stop()` may have run (and torn the listener down) before this hop lands on the
@@ -359,6 +363,7 @@ final class ROMUploadServer: @unchecked Sendable {
                       + "Local Network permission if neither is reachable)")
             }
         }
+        #endif
     }
 
     func stop() {
@@ -366,20 +371,26 @@ final class ROMUploadServer: @unchecked Sendable {
         lock.lock()
         let conns = activeConnections
         let contexts = connectionContexts
+        #if !os(watchOS)
         let webDAVService = bonjourWebDAV
+        #endif
         activeConnections.removeAll()
         connectionContexts.removeAll()
         _bonjourServerURL = nil
+        #if !os(watchOS)
         bonjourWebDAV = nil
+        #endif
         lock.unlock()
 
         for ctx in contexts.values { ctx.watchdog?.cancel() }
         for conn in conns.values { conn.cancel() }
         listener?.cancel()
         listener = nil
+        #if !os(watchOS)
         if let webDAVService {
             DispatchQueue.main.async { webDAVService.stop() }
         }
+        #endif
         port = 0
         cachedIPAddress = nil
         NSLog("[ROMUploadServer] stopped")
@@ -2793,6 +2804,7 @@ final class ROMUploadServer: @unchecked Sendable {
     }
 }
 
+#if !os(watchOS)
 // MARK: - Bonjour Delegate
 
 /// `NetService.publish()` fails silently without a delegate — this logs the explicit
@@ -2811,6 +2823,7 @@ private final class WebDAVBonjourDelegate: NSObject, NetServiceDelegate {
         NSLog("%@", "[ROMUploadServer] _webdav._tcp publish failed: \(errorDict)")
     }
 }
+#endif
 
 // MARK: - Errors
 
