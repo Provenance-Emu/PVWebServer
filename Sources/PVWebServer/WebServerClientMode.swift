@@ -34,7 +34,7 @@ enum WebServerClientMode: Equatable {
         case "POST":
             return ["/upload", "/move", "/mkdir"].contains { request.path.hasPrefix($0) }
         case "GET", "HEAD":
-            return request.path.hasPrefix("/files/") || request.path.hasPrefix("/api/")
+            return request.path.hasPrefix("/files/") || request.routePath.hasPrefix("/api/")
         case "PUT", "DELETE":
             return request.path.hasPrefix("/files/")
         default:

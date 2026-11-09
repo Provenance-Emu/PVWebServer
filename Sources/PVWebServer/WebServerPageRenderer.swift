@@ -76,7 +76,7 @@ enum WebServerPageRenderer {
         guard let url = Bundle.module.url(forResource: name, withExtension: ext),
               let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8) else {
-            NSLog("[ROMUploadServer] missing web resource \(key)")
+            WebServerLog.log(.error, "missing web resource \(key)")
             return nil
         }
         lock.lock()

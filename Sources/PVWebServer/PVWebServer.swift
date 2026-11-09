@@ -122,6 +122,10 @@ public final class PVWebServer: NSObject, @unchecked Sendable {
         self.server.bonjourName = configuration.bonjourName ?? (host.isEmpty ? title : "\(title) (\(host))")
         self.server.defaultUploadDirectory = configuration.defaultUploadDirectory
         self.server.reportsWebDAVMovesAsUploads = configuration.reportsWebDAVMovesAsUploads
+        self.server.advertisesWebDAVService = configuration.advertisesWebDAVService
+        self.server.preservesMultipartSubfolders = configuration.preservesMultipartSubfolders
+        self.server.uploadPageRenderer = configuration.uploadPageRenderer
+        self.server.uploadTransferObserver = configuration.uploadTransferObserver
         self.preferredPorts = configuration.preferredPorts
 
         guard configuration.bridgesUploadsToLibraryRescan else { return }
@@ -177,6 +181,19 @@ public final class PVWebServer: NSObject, @unchecked Sendable {
     /// private queue.
     public func setUnexpectedStopHandler(_ handler: (@Sendable () -> Void)?) {
         server.unexpectedStopHandler = handler
+    }
+
+    /// Called with the name and port `_http._tcp` actually registered under. mDNSResponder renames
+    /// on conflict ("iFly EMU (2)"), so anything else advertised for this server has to follow
+    /// this name, not the configured one. Set before `start()`. Runs on a private queue.
+    public func setBonjourRegistrationHandler(_ handler: (@Sendable (_ name: String, _ port: Int) -> Void)?) {
+        server.onBonjourRegistered = handler.map { handler in { name, port in handler(name, Int(port)) } }
+    }
+
+    /// Seeds the LAN address after probing it off the main thread, so `ipAddress` and the upload
+    /// page never walk the network interfaces on the caller's thread. Cleared by a stop.
+    public func seedCachedIPAddress(_ ip: String) {
+        server.seedCachedIPAddress(ip)
     }
 
     // MARK: - Public ObjC API (legacy surface)
@@ -276,6 +293,15 @@ public final class PVWebServer: NSObject, @unchecked Sendable {
     /// ⚠️  This server is **plain HTTP on the local network** — no TLS. Read the
     /// transport-security note at the top of `WebRoute.swift` before adding a
     /// route that serves anything a user would mind leaking on a shared Wi-Fi.
+    /// Registers an async handler for every path below `pathPrefix`, for a route whose last
+    /// segment is its subject (`GET /api/benchmarks/<name>`). An exact route at the same path
+    /// wins, whatever the registration order. `handler` sees the full path and must validate
+    /// that segment itself.
+    public func addAsyncHandler(forMethod method: String, pathPrefix: String,
+                                handler: @escaping WebRouteHandler) {
+        server.addAsyncHandler(forMethod: method, pathPrefix: pathPrefix, handler: handler)
+    }
+
     public func addAsyncHandler(forMethod method: String, path: String,
                                 handler: @escaping WebRouteHandler) {
         server.addAsyncHandler(forMethod: method, path: path, handler: handler)

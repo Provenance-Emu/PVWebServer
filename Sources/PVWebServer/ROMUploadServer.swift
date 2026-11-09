@@ -110,9 +110,38 @@ final class ROMUploadServer: @unchecked Sendable {
         set { lock.lock(); _unexpectedStopHandler = newValue; lock.unlock() }
     }
 
+    /// Publish `_webdav._tcp` through `NetService` alongside the listener's `_http._tcp`. Turn it
+    /// off when the app advertises WebDAV itself (see `onBonjourRegistered`): two registrations
+    /// of one name and type collide with -72001. Set before `start()`.
+    var advertisesWebDAVService = true
+
+    /// Called on the listener queue with the name and port `_http._tcp` actually registered
+    /// under. mDNSResponder renames on conflict ("iFly EMU (2)"), so anything else advertised
+    /// for this server has to follow this name, not `bonjourName`.
+    var onBonjourRegistered: (@Sendable (_ name: String, _ port: UInt16) -> Void)?
+
+    /// Replaces the bundled upload page at `GET /`. Called off the main thread, possibly from
+    /// several connections at once. Set before `start()`.
+    var uploadPageRenderer: (@Sendable (UploadPageContext) -> String)?
+
+    /// Called once per uploaded file when its writer opens. Return a transfer to observe the
+    /// bytes reaching disk, or nil to skip this file. Set before `start()`.
+    var uploadTransferObserver: (@Sendable () -> (any UploadTransfer)?)?
+
+    /// Keep the sender's folder path in multipart uploads ("set/disc.chd" lands in `set/`) rather
+    /// than flattening to the file name. Set before `start()`.
+    var preservesMultipartSubfolders = false
+
+    /// A buffered request body that has not fully arrived after this long gets a 408. Clients
+    /// such as Finder give up near 60 s, and a stalled body would otherwise hold the socket open.
+    /// Streamed PUT and multipart uploads are not limited by this.
+    var requestBodyTimeout: TimeInterval = 15
+
     // MARK: - State
 
-    private static let readChunkSize = 1_048_576
+    /// Socket read size for headers, bodies and streamed uploads. `SerialFileWriter` writes
+    /// before the next read is armed, so this is also the most one upload holds in memory.
+    private static let readChunkSize = 4 * 1_048_576
     /// Hard cap on any request body we hold in RAM (everything that is not a streamed PUT or a
     /// streamed multipart upload). Over this we answer 413 instead of letting a client grow the
     /// process until the watchdog kills it.
@@ -148,6 +177,7 @@ final class ROMUploadServer: @unchecked Sendable {
 
     /// `ISO8601DateFormatter` is not thread-safe. Depth-1 PROPFINDs run concurrently.
     private static let webDAVDateLock = NSLock()
+    private static let fallbackQuotaBytes: Int64 = 1 << 40
 
     private static let webDAVISO8601Formatter: ISO8601DateFormatter = {
         let fmt = ISO8601DateFormatter()
@@ -159,7 +189,7 @@ final class ROMUploadServer: @unchecked Sendable {
     /// compares against it to tell a dead listener from one it already replaced.
     private(set) var listener: NWListener?
     #if !os(watchOS)
-    private var bonjourWebDAV: NetService?
+    private(set) var bonjourWebDAV: NetService?
     private let bonjourDelegate = WebDAVBonjourDelegate()
     /// Set once `netServiceDidPublish` actually fires for the current `bonjourWebDAV`.
     /// `NetService.publish()` can fail to schedule at all and never call back either
@@ -183,6 +213,8 @@ final class ROMUploadServer: @unchecked Sendable {
     /// answered identically no matter how the connection was classified.
     private var asyncRoutes = WebRouteTable()
     private var cachedIPAddress: String?
+    /// Its own lock: `serverURL` reads the address while holding `lock`.
+    private let ipAddressLock = NSLock()
     /// Proactive directory listing scheduled at start. Cancelled on the first PROPFIND.
     private var directoryWarmup: DispatchWorkItem?
     /// Short-lived 207 bodies keyed by absolute path and listing depth.
@@ -277,11 +309,11 @@ final class ROMUploadServer: @unchecked Sendable {
                 try await startListener(on: candidate)
                 advertiseWebDAV(on: candidate)
                 scheduleDirectoryWarmup()
-                NSLog("[ROMUploadServer] started on :\(candidate)")
+                WebServerLog.log(.info, "started on :\(candidate)")
                 return
             } catch {
                 lastError = error
-                NSLog("[ROMUploadServer] port \(candidate) unavailable (\(error)), trying next")
+                WebServerLog.log(.info, "port \(candidate) unavailable (\(error)), trying next")
             }
         }
         throw lastError ?? ROMUploadServerError.initializationFailed
@@ -295,7 +327,11 @@ final class ROMUploadServer: @unchecked Sendable {
         listener.newConnectionHandler = { [weak self] conn in self?.handleNewConnection(conn) }
         listener.service = NWListener.Service(name: bonjourName, type: "_http._tcp")
         listener.serviceRegistrationUpdateHandler = { [weak self] change in
-            guard let self, case let .add(endpoint) = change, case let .hostPort(host, port) = endpoint else { return }
+            guard let self, case let .add(endpoint) = change else { return }
+            if case let .service(name, _, _, _) = endpoint {
+                self.onBonjourRegistered?(name, candidate)
+            }
+            guard case let .hostPort(host, port) = endpoint else { return }
             let hostStr: String
             switch host {
             case .name(let n, _): hostStr = n
@@ -319,9 +355,9 @@ final class ROMUploadServer: @unchecked Sendable {
                     // Not terminal: Network.framework parks a listener here while, for example,
                     // the Local Network permission prompt is up or mDNS policy is unresolved. It
                     // may still become `.ready`, so only log; the bind timeout below decides.
-                    NSLog("[ROMUploadServer] listener waiting on :\(candidate): \(error)")
+                    WebServerLog.log(.warning, "listener waiting on :\(candidate): \(error)")
                 case .failed(let error):
-                    NSLog("[ROMUploadServer] listener failed on :\(candidate): \(error)")
+                    WebServerLog.log(.error, "listener failed on :\(candidate): \(error)")
                     listener?.cancel()
                     if !resumed {
                         resumed = true
@@ -349,7 +385,7 @@ final class ROMUploadServer: @unchecked Sendable {
             self.listenerQueue.asyncAfter(deadline: .now() + Self.bindTimeout) { [weak listener] in
                 guard !resumed else { return }
                 resumed = true
-                NSLog("[ROMUploadServer] listener on :\(candidate) did not become ready within \(Self.bindTimeout)s, giving up on it")
+                WebServerLog.log(.warning, "listener on :\(candidate) did not become ready within \(Self.bindTimeout)s, giving up on it")
                 listener?.cancel()
                 continuation.resume(throwing: ROMUploadServerError.bindTimedOut(port: candidate))
             }
@@ -372,7 +408,7 @@ final class ROMUploadServer: @unchecked Sendable {
         guard listener === dead else { lock.unlock(); return }
         let handler = _unexpectedStopHandler
         lock.unlock()
-        NSLog("[ROMUploadServer] listener stopped unexpectedly; taking the server down")
+        WebServerLog.log(.warning, "listener stopped unexpectedly; taking the server down")
         stop()
         handler?()
     }
@@ -380,6 +416,7 @@ final class ROMUploadServer: @unchecked Sendable {
     private func advertiseWebDAV(on candidate: UInt16) {
         // watchOS advertises HTTP through NWListener. NetService is unavailable there.
         #if !os(watchOS)
+        guard advertisesWebDAVService else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             // `stop()` may have run (and torn the listener down) before this hop lands on the
@@ -410,7 +447,7 @@ final class ROMUploadServer: @unchecked Sendable {
                 let stillCurrent = self.isRunningUnlocked && self.port == candidate
                 self.lock.unlock()
                 guard stillCurrent, !confirmed else { return }
-                NSLog("[ROMUploadServer] _webdav._tcp NetService published no service within 5s "
+                WebServerLog.log(.warning, "_webdav._tcp NetService published no service within 5s "
                       + "(NWListener's _http._tcp registration is the working path; check "
                       + "Local Network permission if neither is reachable)")
             }
@@ -446,8 +483,10 @@ final class ROMUploadServer: @unchecked Sendable {
             DispatchQueue.main.async { webDAVService.stop() }
         }
         #endif
+        ipAddressLock.lock()
         cachedIPAddress = nil
-        NSLog("[ROMUploadServer] stopped")
+        ipAddressLock.unlock()
+        WebServerLog.log(.info, "stopped")
     }
 
     /// Prime directory metadata without occupying a PROPFIND worker.
@@ -506,9 +545,26 @@ final class ROMUploadServer: @unchecked Sendable {
     /// Read the transport-security note at the top of `WebRoute.swift` before
     /// adding a route: this server is plain HTTP on the LAN.
     func addAsyncHandler(forMethod method: String, path: String,
-                         handler: @escaping WebRouteHandler) {
+                                handler: @escaping WebRouteHandler) {
         lock.lock(); defer { lock.unlock() }
         asyncRoutes.register(method: method, path: path, handler: handler)
+    }
+
+    /// Registers an async handler for every path below `pathPrefix`, for a route whose last
+    /// segment is its subject (`GET /api/benchmarks/<name>`). An exact route at the same path
+    /// wins, whatever the registration order. `handler` sees the full path and must validate
+    /// that segment itself.
+    func addAsyncHandler(forMethod method: String, pathPrefix: String,
+                                handler: @escaping WebRouteHandler) {
+        lock.lock(); defer { lock.unlock() }
+        asyncRoutes.register(method: method, pathPrefix: pathPrefix, handler: handler)
+    }
+
+    /// Seeds the cached LAN address after probing it off the main thread, so `ipAddress` and the
+    /// upload page never walk the network interfaces on the caller's thread.
+    func seedCachedIPAddress(_ ip: String) {
+        ipAddressLock.lock(); defer { ipAddressLock.unlock() }
+        cachedIPAddress = ip
     }
 
     // MARK: - Connection Handling
@@ -525,7 +581,7 @@ final class ROMUploadServer: @unchecked Sendable {
             let seen = self.connectionContexts[connID]?.firstRequestSeen ?? true
             self.lock.unlock()
             guard !seen else { return }
-            NSLog("[ROMUploadServer] connection stalled at establishment; cancelling so the client retries")
+            WebServerLog.log(.warning, "connection stalled at establishment; cancelling so the client retries")
             connection.cancel()
         }
 
@@ -543,7 +599,7 @@ final class ROMUploadServer: @unchecked Sendable {
             case .ready:
                 self.armInitialReceiveIfNeeded(on: connection)
             case .waiting(let error):
-                NSLog("[ROMUploadServer] inbound connection waiting: \(error)")
+                WebServerLog.log(.warning, "inbound connection waiting: \(error)")
             case .cancelled, .failed:
                 self.lock.lock()
                 self.activeConnections.removeValue(forKey: connID)
@@ -634,11 +690,8 @@ final class ROMUploadServer: @unchecked Sendable {
             self.lock.unlock()
 
             if let error {
-                let ns = error as NSError
-                let posixCode = ns.domain == NSPOSIXErrorDomain ? ns.code
-                    : (ns.userInfo["POSIXErrorCode"] as? Int)
-                if posixCode != 54 && posixCode != 96 {
-                    NSLog("[ROMUploadServer] receive error: \(error)")
+                if !Self.isBenignConnectionError(error) {
+                    WebServerLog.log(.info, "receive error: \(error)")
                 }
                 connection.cancel()
                 return
@@ -648,6 +701,18 @@ final class ROMUploadServer: @unchecked Sendable {
             if let data { buffer.append(data) }
             self.processIncomingBuffer(on: connection, buffer: buffer)
         }
+    }
+
+    /// Finder and browsers often reset idle keep-alive sockets (POSIX 54 and 96), which is not a
+    /// server fault. Walks the underlying errors: Network.framework nests the POSIX one.
+    static func isBenignConnectionError(_ error: Error) -> Bool {
+        var current: NSError? = error as NSError
+        while let ns = current {
+            if ns.domain == NSPOSIXErrorDomain, ns.code == 54 || ns.code == 96 { return true }
+            if let code = ns.userInfo["POSIXErrorCode"] as? Int, code == 54 || code == 96 { return true }
+            current = ns.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return false
     }
 
     /// Parse buffered bytes into HTTP requests; may leave pipelined tail for keep-alive.
@@ -791,7 +856,7 @@ final class ROMUploadServer: @unchecked Sendable {
 
         // Everything past this point is buffered whole in RAM, so it needs a ceiling.
         guard request.contentLength <= Self.maxBufferedBodyBytes else {
-            NSLog("%@", "[ROMUploadServer] \(request.method) \(request.path): Content-Length \(request.contentLength) exceeds the buffered-body cap; answering 413")
+            WebServerLog.log(.warning, "\(request.method) \(request.path): Content-Length \(request.contentLength) exceeds the buffered-body cap; answering 413")
             sendResponse(on: connection, status: 413, statusText: "Request Entity Too Large",
                          body: "Request body too large", request: request,
                          isWebDAV: isWebDAV, forceClose: true)
@@ -800,23 +865,59 @@ final class ROMUploadServer: @unchecked Sendable {
 
         bufferRemainingBody(on: connection, initial: initialBody,
                             remaining: remaining) { [weak self] fullBody in
+            guard let fullBody else {
+                self?.sendRequestTimeout(on: connection, request: request, isWebDAV: isWebDAV)
+                return
+            }
             self?.routeRequest(on: connection, request: request, body: fullBody, isWebDAV: isWebDAV)
         }
     }
 
+    private func sendRequestTimeout(on connection: NWConnection, request: HTTPRequest, isWebDAV: Bool) {
+        WebServerLog.log(.warning, "\(request.method) \(request.path): body did not arrive in \(requestBodyTimeout)s; answering 408")
+        sendResponse(on: connection, status: 408, statusText: "Request Timeout",
+                     body: "Request body timed out", request: request,
+                     isWebDAV: isWebDAV, forceClose: true)
+    }
+
+    /// Runs `body` once `requestBodyTimeout` has passed unless `cancel` got there first. Receive
+    /// callbacks and this deadline both run on the connection's queue, so `finished` flags need
+    /// no lock. Nil when the connection is already gone.
+    private func armBodyDeadline(on connection: NWConnection, body: @escaping () -> Void) -> DispatchWorkItem? {
+        guard let ioQueue = connectionIOQueue(for: connection) else { return nil }
+        let deadline = DispatchWorkItem(block: body)
+        ioQueue.asyncAfter(deadline: .now() + requestBodyTimeout, execute: deadline)
+        return deadline
+    }
+
+    /// `completion` gets nil when the body missed `requestBodyTimeout`.
     private func bufferRemainingBody(on connection: NWConnection,
                                      initial: Data,
                                      remaining: Int,
-                                     completion: @escaping (Data) -> Void) {
+                                     completion: @escaping (Data?) -> Void) {
         var buffer = initial
+        var finished = false
+        var deadline: DispatchWorkItem?
+        func finish(_ outcome: Data?) {
+            guard !finished else { return }
+            finished = true
+            deadline?.cancel()
+            completion(outcome)
+        }
+        deadline = armBodyDeadline(on: connection) { finish(nil) }
+        guard deadline != nil else {
+            connection.cancel()
+            return
+        }
         func readRemaining(_ bytesLeft: Int) {
-            if bytesLeft <= 0 { completion(buffer); return }
+            if bytesLeft <= 0 { finish(buffer); return }
             connection.receive(minimumIncompleteLength: 1,
                                maximumLength: min(bytesLeft, Self.readChunkSize)) { data, _, isComplete, error in
+                guard !finished else { return }
                 if let data { buffer.append(data) }
                 let newLeft = bytesLeft - (data?.count ?? 0)
                 if newLeft <= 0 || isComplete || error != nil {
-                    completion(buffer)
+                    finish(buffer)
                 } else {
                     readRemaining(newLeft)
                 }
@@ -849,13 +950,22 @@ final class ROMUploadServer: @unchecked Sendable {
             return
         }
 
-        accumulateChunkedBody(on: connection, initial: initial) { [weak self] body, trailing, overflowed in
+        accumulateChunkedBody(on: connection, initial: initial) { [weak self] outcome in
             guard let self else { return }
-            guard !overflowed else {
+            let body: Data
+            let trailing: Data
+            switch outcome {
+            case .overflowed:
                 self.sendResponse(on: connection, status: 413, statusText: "Request Entity Too Large",
                                   body: "Request body too large", request: request,
                                   isWebDAV: isWebDAV, forceClose: true)
                 return
+            case .timedOut:
+                self.sendRequestTimeout(on: connection, request: request, isWebDAV: isWebDAV)
+                return
+            case let .ready(readyBody, readyTrailing):
+                body = readyBody
+                trailing = readyTrailing
             }
             if !trailing.isEmpty {
                 let connID = ObjectIdentifier(connection)
@@ -951,14 +1061,30 @@ final class ROMUploadServer: @unchecked Sendable {
         }
     }
 
+    private enum ChunkedAccumulation {
+        case ready(body: Data, trailing: Data)
+        /// The body blew past `maxBufferedBodyBytes`; it was discarded and the caller answers 413.
+        case overflowed
+        /// The body missed `requestBodyTimeout`; the caller answers 408.
+        case timedOut
+    }
+
     /// Buffers a chunked body in RAM for the non-PUT routes (`/move`, `/mkdir`, PROPPATCH, a
-    /// custom handler). `completion`'s third argument is true when the body blew past
-    /// `maxBufferedBodyBytes`, in which case the body is discarded and the caller answers 413.
+    /// custom handler).
     private func accumulateChunkedBody(on connection: NWConnection,
                                        initial: Data,
-                                       completion: @escaping (Data, Data, Bool) -> Void) {
+                                       completion: @escaping (ChunkedAccumulation) -> Void) {
         let reader = ChunkedBodyReader()
         var body = Data()
+        var finished = false
+        var deadline: DispatchWorkItem?
+
+        func finish(_ outcome: ChunkedAccumulation) {
+            guard !finished else { return }
+            finished = true
+            deadline?.cancel()
+            completion(outcome)
+        }
 
         func process(_ events: [ChunkedBodyReader.Event]) -> Bool {
             for event in events {
@@ -966,19 +1092,25 @@ final class ROMUploadServer: @unchecked Sendable {
                 case .payload(let chunk):
                     body.append(chunk)
                     if body.count > Self.maxBufferedBodyBytes {
-                        NSLog("[ROMUploadServer] chunked body exceeded the buffered-body cap; answering 413")
-                        completion(Data(), Data(), true)
+                        WebServerLog.log(.warning, "chunked body exceeded the buffered-body cap; answering 413")
+                        finish(.overflowed)
                         return true
                     }
                 case .complete(let trailing):
-                    completion(body, trailing, false)
+                    finish(.ready(body: body, trailing: trailing))
                     return true
                 case .invalid:
-                    completion(body, Data(), false)
+                    finish(.ready(body: body, trailing: Data()))
                     return true
                 }
             }
             return false
+        }
+
+        deadline = armBodyDeadline(on: connection) { finish(.timedOut) }
+        guard deadline != nil else {
+            connection.cancel()
+            return
         }
 
         if process(reader.feed(initial)) { return }
@@ -986,14 +1118,15 @@ final class ROMUploadServer: @unchecked Sendable {
         func readMore() {
             connection.receive(minimumIncompleteLength: 1, maximumLength: Self.readChunkSize) {
                 data, _, isComplete, error in
+                guard !finished else { return }
                 if error != nil {
-                    completion(body, Data(), false)
+                    finish(.ready(body: body, trailing: Data()))
                     return
                 }
                 let events = reader.feed(data ?? Data())
                 if process(events) { return }
                 if isComplete {
-                    completion(body, Data(), false)
+                    finish(.ready(body: body, trailing: Data()))
                     return
                 }
                 readMore()
@@ -1010,12 +1143,12 @@ final class ROMUploadServer: @unchecked Sendable {
                                   isWebDAV: Bool,
                                   initial: Data) {
         invalidatePropfindCache()
-        guard let target = resolvePutTarget(on: connection, request: request, isWebDAV: isWebDAV),
-              let writer = openPutTarget(target, on: connection, request: request, isWebDAV: isWebDAV)
-        else { return }
+        guard let target = resolvePutTarget(on: connection, request: request, isWebDAV: isWebDAV) else { return }
+        let overwrote = isExistingFile(target)
+        guard let writer = openPutTarget(target, on: connection, request: request, isWebDAV: isWebDAV) else { return }
         postUploadStarted(path: target.path)
         let reader = ChunkedBodyReader()
-        let finish = putFinish(on: connection, request: request, isWebDAV: isWebDAV)
+        let finish = putFinish(on: connection, request: request, isWebDAV: isWebDAV, overwrote: overwrote)
 
         let finishSuccess: (Data) -> Void = { [weak self] trailing in
             guard let self else { return }
@@ -1042,7 +1175,7 @@ final class ROMUploadServer: @unchecked Sendable {
                 case .invalid:
                     writer.finalize { [weak self] in
                         guard let self else { return }
-                        NSLog("%@", "[ROMUploadServer] upload FAILED for \(target.lastPathComponent): invalid chunked body after \(writer.bytesWritten) bytes — deleting partial file")
+                        WebServerLog.log(.error, "upload FAILED for \(target.lastPathComponent): invalid chunked body after \(writer.bytesWritten) bytes — deleting partial file")
                         try? FileManager.default.removeItem(at: target)
                         self.sendPutBadRequest(on: connection, request: request, isWebDAV: isWebDAV,
                                                reason: "Invalid chunked body")
@@ -1090,12 +1223,13 @@ final class ROMUploadServer: @unchecked Sendable {
         lock.lock()
         let routeTable = asyncRoutes
         lock.unlock()
-        if let handler = routeTable.handler(forMethod: request.method, path: request.path) {
+        if let handler = routeTable.handler(forMethod: request.method, path: request.routePath) {
             dispatchAsyncRoute(handler, on: connection, request: request, body: body, isWebDAV: isWebDAV)
             return
         }
 
         if !isWebDAV {
+            let routePath = request.routePath
             lock.lock()
             let routes = customRoutes
             lock.unlock()
@@ -1103,14 +1237,14 @@ final class ROMUploadServer: @unchecked Sendable {
             for route in routes {
                 guard route.method == request.method else { continue }
                 if let exactPath = route.path {
-                    guard request.path == exactPath else { continue }
+                    guard routePath == exactPath else { continue }
                 } else if let regex = route.regex {
-                    let range = NSRange(request.path.startIndex..., in: request.path)
-                    guard regex.firstMatch(in: request.path, range: range) != nil else { continue }
+                    let range = NSRange(routePath.startIndex..., in: routePath)
+                    guard regex.firstMatch(in: routePath, range: range) != nil else { continue }
                 }
 
                 let queryDict = request.queryParameters
-                let result = route.handler(request.method, request.path,
+                let result = route.handler(request.method, routePath,
                                            queryDict.isEmpty ? nil : queryDict,
                                            body.isEmpty ? nil : body)
 
@@ -1120,7 +1254,8 @@ final class ROMUploadServer: @unchecked Sendable {
                         sendDataResponse(on: connection, status: 200, statusText: "OK",
                                          contentType: ct, body: rawData,
                                          request: request, isWebDAV: isWebDAV)
-                    } else if let jsonData = try? JSONSerialization.data(
+                    } else if JSONSerialization.isValidJSONObject(result),
+                              let jsonData = try? JSONSerialization.data(
                         withJSONObject: result, options: [.sortedKeys]) {
                         sendDataResponse(on: connection, status: 200, statusText: "OK",
                                          contentType: "application/json", body: jsonData,
@@ -1162,7 +1297,7 @@ final class ROMUploadServer: @unchecked Sendable {
                                     isWebDAV: Bool) {
         let routeRequest = WebRouteRequest(
             method: request.method,
-            path: request.path,
+            path: request.routePath,
             query: request.queryParameters,
             headers: request.headers,
             body: body.isEmpty ? nil : body
@@ -1296,7 +1431,7 @@ final class ROMUploadServer: @unchecked Sendable {
     // MARK: - HTTP Routes
 
     private func routeHTTP(on connection: NWConnection, request: HTTPRequest, body: Data) {
-        let path = request.path
+        let path = request.routePath.hasPrefix("/api/") ? request.routePath : request.path
         switch (request.method, path) {
         case ("GET", "/"):
             serveHTML(on: connection, request: request, subpath: request.queryParameters["path"] ?? "")
@@ -1366,10 +1501,12 @@ final class ROMUploadServer: @unchecked Sendable {
                 ? "<tr><td colspan=\"3\" class=\"empty\">No files yet. Drag and drop above to upload!</td></tr>"
                 : ""
 
-            let html = WebServerPageRenderer.uploadPage(
+            let fileRows = rows.isEmpty ? emptyMessage : rows.joined(separator: "\n")
+            let html = self.uploadPageRenderer?(UploadPageContext(
+                ipAddress: ip, portSuffix: portSuffix, fileRows: fileRows, currentPath: currentSub
+            )) ?? WebServerPageRenderer.uploadPage(
                 appName: self.pageTitle, ipAddress: ip, portSuffix: portSuffix,
-                fileRows: rows.isEmpty ? emptyMessage : rows.joined(separator: "\n"),
-                currentPath: currentSub
+                fileRows: fileRows, currentPath: currentSub
             )
             let data = Data(html.utf8)
 
@@ -1627,6 +1764,8 @@ final class ROMUploadServer: @unchecked Sendable {
         remaining: Int
     ) {
         let parser = StreamingMultipartParser(
+            preservesSubfolders: preservesMultipartSubfolders,
+            uploadTransferObserver: uploadTransferObserver,
             boundary: boundary,
             outputDirectory: uploadDirectory(for: request),
             onFileCompleted: { [weak self] path in self?.postUploadCompleted(filePath: path) }
@@ -1696,6 +1835,8 @@ final class ROMUploadServer: @unchecked Sendable {
             return
         }
         let parser = StreamingMultipartParser(
+            preservesSubfolders: preservesMultipartSubfolders,
+            uploadTransferObserver: uploadTransferObserver,
             boundary: boundary,
             outputDirectory: uploadDirectory(for: request),
             onFileCompleted: { [weak self] path in self?.postUploadCompleted(filePath: path) }
@@ -1811,7 +1952,7 @@ final class ROMUploadServer: @unchecked Sendable {
         writer.finalize { [weak self] in
             guard let self else { return }
             if let failure = UploadFailure.classify(writer: writer, truncated: truncated) {
-                NSLog("%@", "[ROMUploadServer] upload FAILED for \(target.lastPathComponent): \(failure.logReason) after \(writer.bytesWritten) bytes — deleting partial file")
+                WebServerLog.log(.error, "upload FAILED for \(target.lastPathComponent): \(failure.logReason) after \(writer.bytesWritten) bytes — deleting partial file")
                 try? FileManager.default.removeItem(at: target)
                 finish(failure)
                 return
@@ -1851,7 +1992,9 @@ final class ROMUploadServer: @unchecked Sendable {
         }
     }
 
-    private func webDAVPutFinish(on connection: NWConnection, request: HTTPRequest) -> PutFinish {
+    /// Answers 201 for a new file and 204 for a replaced one (RFC 4918 §9.7.1). Finder treats the
+    /// two alike, but `overwrote` has to be read before `openPutTarget` removes the old file.
+    private func webDAVPutFinish(on connection: NWConnection, request: HTTPRequest, overwrote: Bool) -> PutFinish {
         return { [weak self] failure in
             guard let self else { return }
             if let failure {
@@ -1859,9 +2002,24 @@ final class ROMUploadServer: @unchecked Sendable {
                                         statusText: failure.statusText, body: "Upload failed",
                                         request: request, forceClose: true)
             } else {
-                self.sendWebDAVResponse(on: connection, status: 201, statusText: "Created", request: request)
+                self.sendWebDAVResponse(on: connection, status: overwrote ? 204 : 201,
+                                        statusText: overwrote ? "No Content" : "Created", request: request)
             }
         }
+    }
+
+    /// RFC 4918 §10.6: `Overwrite: F` on an existing resource is a 412, and nothing is replaced.
+    private func webDAVPutIsRefused(on connection: NWConnection, request: HTTPRequest, target: URL) -> Bool {
+        guard request.headers["overwrite"]?.trimmingCharacters(in: .whitespaces).uppercased() == "F",
+              isExistingFile(target) else { return false }
+        sendWebDAVResponse(on: connection, status: 412, statusText: "Precondition Failed",
+                           body: "Target exists", request: request, forceClose: true)
+        return true
+    }
+
+    private func isExistingFile(_ url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && !isDirectory.boolValue
     }
 
     // MARK: - Streaming WebDAV PUT
@@ -1876,13 +2034,13 @@ final class ROMUploadServer: @unchecked Sendable {
     private func streamPut(on connection: NWConnection, request: HTTPRequest, isWebDAV: Bool,
                            initialBody: Data, remaining: Int) {
         invalidatePropfindCache()
-        guard let target = resolvePutTarget(on: connection, request: request, isWebDAV: isWebDAV),
-              let writer = openPutTarget(target, on: connection, request: request, isWebDAV: isWebDAV)
-        else { return }
+        guard let target = resolvePutTarget(on: connection, request: request, isWebDAV: isWebDAV) else { return }
+        let overwrote = isExistingFile(target)
+        guard let writer = openPutTarget(target, on: connection, request: request, isWebDAV: isWebDAV) else { return }
         postUploadStarted(path: target.path)
         writer.write(initialBody)
         streamPutChunks(on: connection, writer: writer, target: target, remaining: remaining,
-                        finish: putFinish(on: connection, request: request, isWebDAV: isWebDAV))
+                        finish: putFinish(on: connection, request: request, isWebDAV: isWebDAV, overwrote: overwrote))
     }
 
     private enum PutTargetOpen {
@@ -1902,18 +2060,18 @@ final class ROMUploadServer: @unchecked Sendable {
         let fm = FileManager.default
         var isDir: ObjCBool = false
         if fm.fileExists(atPath: target.path, isDirectory: &isDir), isDir.boolValue {
-            NSLog("%@", "[ROMUploadServer] PUT: refusing to overwrite the directory \(target.lastPathComponent)")
+            WebServerLog.log(.warning, "PUT: refusing to overwrite the directory \(target.lastPathComponent)")
             return .isDirectory
         }
         do {
             try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
         } catch {
-            NSLog("%@", "[ROMUploadServer] PUT: cannot create parent for \(target.lastPathComponent): \(error)")
+            WebServerLog.log(.error, "PUT: cannot create parent for \(target.lastPathComponent): \(error)")
             return .failed
         }
         if fm.fileExists(atPath: target.path) { try? fm.removeItem(at: target) }
-        guard let writer = SerialFileWriter(at: target) else {
-            NSLog("%@", "[ROMUploadServer] PUT: cannot open \(target.path) for writing")
+        guard let writer = SerialFileWriter(at: target, transfer: uploadTransferObserver?()) else {
+            WebServerLog.log(.error, "PUT: cannot open \(target.path) for writing")
             return .failed
         }
         return .writer(writer)
@@ -1968,12 +2126,13 @@ final class ROMUploadServer: @unchecked Sendable {
             }
             return nil
         }
+        if isWebDAV, webDAVPutIsRefused(on: connection, request: request, target: target) { return nil }
         return target
     }
 
     private func putFinish(on connection: NWConnection, request: HTTPRequest,
-                           isWebDAV: Bool) -> PutFinish {
-        isWebDAV ? webDAVPutFinish(on: connection, request: request)
+                           isWebDAV: Bool, overwrote: Bool) -> PutFinish {
+        isWebDAV ? webDAVPutFinish(on: connection, request: request, overwrote: overwrote)
                  : browserPutFinish(on: connection, request: request)
     }
 
@@ -2031,7 +2190,7 @@ final class ROMUploadServer: @unchecked Sendable {
         switch request.method {
         case "OPTIONS": handleWebDAVOptions(on: connection, request: request)
         case "PROPFIND": handlePROPFIND(on: connection, request: request, path: decoded,
-                                        depth: request.headers["depth"] ?? "1")
+                                        depth: request.headers["depth"] ?? "1", body: body)
         case "GET": serveWebDAVFile(on: connection, request: request, path: decoded, includeBody: true)
         case "HEAD": serveWebDAVFile(on: connection, request: request, path: decoded, includeBody: false)
         case "DELETE": handleWebDAVDelete(on: connection, request: request, path: decoded)
@@ -2039,7 +2198,7 @@ final class ROMUploadServer: @unchecked Sendable {
         case "MOVE": handleMOVE(on: connection, request: request, path: decoded)
         case "COPY": handleCOPY(on: connection, request: request, path: decoded)
         case "PUT": handleWebDAVPutBuffered(on: connection, request: request, path: decoded, body: body)
-        case "LOCK": handleWebDAVLock(on: connection, request: request, path: decoded)
+        case "LOCK": handleWebDAVLock(on: connection, request: request, path: decoded, body: body)
         case "UNLOCK": handleWebDAVUnlock(on: connection, request: request)
         case "PROPPATCH": handlePROPPATCH(on: connection, request: request, path: decoded, body: body)
         default:
@@ -2057,8 +2216,25 @@ final class ROMUploadServer: @unchecked Sendable {
         ], body: Data(), request: request, isWebDAV: true)
     }
 
-    private func handleWebDAVLock(on connection: NWConnection, request: HTTPRequest, path: String) {
-        let token = "opaquelocktoken:icube-\(UUID().uuidString)"
+    /// A synthetic exclusive-write lock: Finder only mounts read-write against DAV class 2, and
+    /// there is no lock table for anonymous guests. The target need not exist yet (a lock-null
+    /// resource), so new-file PUTs still work.
+    private func handleWebDAVLock(on connection: NWConnection, request: HTTPRequest, path: String, body: Data) {
+        guard WebDAVRequestParsing.isSupportedLockRequest(body) else {
+            sendWebDAVResponse(on: connection, status: 403, statusText: "Forbidden",
+                               body: "Only exclusive write locks are supported", request: request)
+            return
+        }
+        guard path.isEmpty || resolvedPath(path, within: romsDirectory) != nil else {
+            sendWebDAVResponse(on: connection, status: 403, statusText: "Forbidden", request: request)
+            return
+        }
+
+        let token = "urn:uuid:\(UUID().uuidString)"
+        let href = "/" + path.split(separator: "/").map { String($0).urlPathEscaped }.joined(separator: "/")
+        let lockRoot = "http://\(request.headers["host"] ?? "localhost")\(href)"
+        let depth = request.headers["depth"] ?? "0"
+        let timeout = request.headers["timeout"] ?? "Second-3600"
         let xml = """
         <?xml version="1.0" encoding="utf-8"?>
         <D:prop xmlns:D="DAV:">
@@ -2066,8 +2242,10 @@ final class ROMUploadServer: @unchecked Sendable {
             <D:activelock>
               <D:locktype><D:write/></D:locktype>
               <D:lockscope><D:exclusive/></D:lockscope>
-              <D:timeout>Second-3600</D:timeout>
+              <D:depth>\(depth.xmlEscaped)</D:depth>
+              <D:timeout>\(timeout.xmlEscaped)</D:timeout>
               <D:locktoken><D:href>\(token.xmlEscaped)</D:href></D:locktoken>
+              <D:lockroot><D:href>\(lockRoot.xmlEscaped)</D:href></D:lockroot>
             </D:activelock>
           </D:lockdiscovery>
         </D:prop>
@@ -2078,17 +2256,17 @@ final class ROMUploadServer: @unchecked Sendable {
             "Content-Length": "\(data.count)",
             "Lock-Token": "<\(token)>"
         ], body: data, request: request, isWebDAV: true)
-        _ = path
     }
 
     private func handleWebDAVUnlock(on connection: NWConnection, request: HTTPRequest) {
         sendWebDAVResponse(on: connection, status: 204, statusText: "No Content", request: request)
     }
 
-    /// Absolute path + listing depth. Finder repeats this pair during a mount.
+    /// Absolute path + listing depth + requested properties. Finder repeats these during a mount.
     private struct PropfindCacheKey: Hashable {
         let path: String
         let depth: String
+        let properties: PropfindProperties
     }
 
     /// Cached 207 body. `storedAt` is compared against `propfindCacheTTL`.
@@ -2098,8 +2276,10 @@ final class ROMUploadServer: @unchecked Sendable {
         let storedAt: Date
     }
 
-    private func handlePROPFIND(on connection: NWConnection, request: HTTPRequest, path: String, depth: String) {
+    private func handlePROPFIND(on connection: NWConnection, request: HTTPRequest, path: String,
+                                depth: String, body: Data) {
         cancelDirectoryWarmup()
+        let properties = WebDAVRequestParsing.propfindProperties(body)
 
         let target: URL
         if path.isEmpty {
@@ -2117,12 +2297,12 @@ final class ROMUploadServer: @unchecked Sendable {
         // Finder sends `infinity`. A recursive walk of a ROM library stalls the mount.
         let listingDepth = depth.lowercased() == "0" ? "0" : "1"
         let displayPath = path.isEmpty ? "/" : "/" + path
-        let cacheKey = PropfindCacheKey(path: target.path, depth: listingDepth)
+        let cacheKey = PropfindCacheKey(path: target.path, depth: listingDepth, properties: properties)
         let started = Date()
 
         if let cached = cachedPROPFIND(for: cacheKey) {
             let elapsed = Int(Date().timeIntervalSince(started) * 1000)
-            NSLog("[ROMUploadServer] PROPFIND depth=\(listingDepth) \(displayPath) cache hit \(cached.entryCount) entries in \(elapsed)ms")
+            WebServerLog.log(.debug, "PROPFIND depth=\(listingDepth) \(displayPath) cache hit \(cached.entryCount) entries in \(elapsed)ms")
             sendWebDAVMultistatus(on: connection, body: cached.body, request: request)
             return
         }
@@ -2140,7 +2320,7 @@ final class ROMUploadServer: @unchecked Sendable {
             let data = server.webDAVMultistatusData(blocks: responses)
             server.storePROPFIND(data, entryCount: responses.count, for: cacheKey)
             let elapsed = Int(Date().timeIntervalSince(started) * 1000)
-            NSLog("[ROMUploadServer] PROPFIND depth=\(listingDepth) \(displayPath) responded in \(elapsed)ms (\(responses.count) entries)")
+            WebServerLog.log(.debug, "PROPFIND depth=\(listingDepth) \(displayPath) responded in \(elapsed)ms (\(responses.count) entries)")
             server.sendWebDAVMultistatus(on: connection, body: data, request: request)
         }
 
@@ -2148,26 +2328,27 @@ final class ROMUploadServer: @unchecked Sendable {
         // never wait behind a directory walk.
         if listingDepth == "0" {
             var responses: [String] = []
-            appendPROPFINDEntries(at: URL(fileURLWithPath: targetPath), depth: listingDepth, into: &responses)
+            appendPROPFINDEntries(at: URL(fileURLWithPath: targetPath), depth: listingDepth,
+                                  properties: properties, into: &responses)
             finish(self, responses)
             return
         }
 
         guard let ioQueue else {
-            NSLog("[ROMUploadServer] PROPFIND dropped — connection context missing \(displayPath)")
+            WebServerLog.log(.error, "PROPFIND dropped — connection context missing \(displayPath)")
             connection.cancel()
             return
         }
 
-        NSLog("[ROMUploadServer] PROPFIND depth=\(listingDepth) \(displayPath) queued")
+        WebServerLog.log(.debug, "PROPFIND depth=\(listingDepth) \(displayPath) queued")
         Self.propfindQueue.addOperation { [weak self] in
             guard let self else {
                 ioQueue.async { connection.cancel() }
                 return
             }
             var responses: [String] = []
-            self.appendPROPFINDEntries(at: URL(fileURLWithPath: targetPath),
-                                       depth: listingDepth, into: &responses)
+            self.appendPROPFINDEntries(at: URL(fileURLWithPath: targetPath), depth: listingDepth,
+                                       properties: properties, into: &responses)
             ioQueue.async { [weak self] in
                 guard let self else {
                     connection.cancel()
@@ -2231,8 +2412,11 @@ final class ROMUploadServer: @unchecked Sendable {
     /// Collects PROPFIND responses for depth 0 (the item) or 1 (one child level).
     /// Anything else, including Finder's `infinity`, is one level — a recursive
     /// walk of a ROM library stalls the mount.
-    private func appendPROPFINDEntries(at url: URL, depth: String, into responses: inout [String]) {
-        responses.append(propfindEntry(for: url))
+    private func appendPROPFINDEntries(at url: URL, depth: String, properties: PropfindProperties,
+                                       into responses: inout [String]) {
+        // One filesystem stat per response, shared by every entry.
+        let quota = properties.wantsQuota ? webDAVVolumeQuota() : nil
+        responses.append(propfindEntry(for: url, properties: properties, quota: quota))
         guard depth != "0" else { return }
 
         var isDir: ObjCBool = false
@@ -2247,41 +2431,80 @@ final class ROMUploadServer: @unchecked Sendable {
         )) ?? []
 
         for child in contents where !child.lastPathComponent.hasPrefix(".") {
-            responses.append(propfindEntry(for: child))
+            responses.append(propfindEntry(for: child, properties: properties, quota: quota))
         }
     }
 
-    private func propfindEntry(for url: URL) -> String {
+    /// Volume space for quota properties. Finder stalls the mount if it asked for quota and the
+    /// properties come back empty, so a failed stat reports a nominal 1 TiB instead.
+    private func webDAVVolumeQuota() -> WebDAVVolumeQuota {
+        if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: romsDirectory.path),
+           let free = attrs[.systemFreeSize] as? Int64,
+           let total = attrs[.systemSize] as? Int64 {
+            return WebDAVVolumeQuota(available: free, used: max(0, total - free), total: total)
+        }
+        return WebDAVVolumeQuota(available: Self.fallbackQuotaBytes, used: 0, total: Self.fallbackQuotaBytes)
+    }
+
+    private func propfindEntry(for url: URL, properties: PropfindProperties, quota: WebDAVVolumeQuota?) -> String {
         let attrs = try? url.resourceValues(forKeys: [
             .fileSizeKey, .contentModificationDateKey, .creationDateKey, .isDirectoryKey
         ])
         let isDir = attrs?.isDirectory ?? false
-        let size = attrs?.fileSize ?? 0
-        let mtime = webDAVFormattedDate(attrs?.contentModificationDate)
-        let ctime = webDAVFormattedDate(attrs?.creationDate)
-        let displayName = url.lastPathComponent
-        let href = webDAVHref(for: url)
-        let resourceType = isDir ? "<D:collection/>" : ""
-        let contentType = isDir ? "" : "<D:getcontenttype>\(mimeType(for: url).xmlEscaped)</D:getcontenttype>"
-        let creationProp = ctime.isEmpty ? "" : "<D:creationdate>\(ctime)</D:creationdate>"
+
+        var lines: [String] = []
+        if properties.contains(.resourceType) {
+            lines.append(isDir ? "<D:resourcetype><D:collection/></D:resourcetype>" : "<D:resourcetype/>")
+        }
+        if properties.contains(.displayName) {
+            lines.append("<D:displayname>\(url.lastPathComponent.xmlEscaped)</D:displayname>")
+        }
+        if properties.contains(.contentLength) {
+            lines.append("<D:getcontentlength>\(attrs?.fileSize ?? 0)</D:getcontentlength>")
+        }
+        if properties.contains(.lastModified) {
+            let modified = attrs?.contentModificationDate.map(WebDAVRequestParsing.lastModifiedString) ?? ""
+            lines.append("<D:getlastmodified>\(modified)</D:getlastmodified>")
+        }
+        if properties.contains(.creationDate), attrs?.creationDate != nil {
+            lines.append("<D:creationdate>\(webDAVFormattedDate(attrs?.creationDate))</D:creationdate>")
+        }
+        if properties.contains(.contentType), !isDir {
+            lines.append("<D:getcontenttype>\(mimeType(for: url).xmlEscaped)</D:getcontenttype>")
+        }
+        // Only collections take locks here: a file's PUT replaces it, and Finder reads these
+        // from the listing root.
+        if properties.contains(.supportedLock), isDir {
+            lines.append("""
+            <D:supportedlock>
+                <D:lockentry>
+                    <D:lockscope><D:exclusive/></D:lockscope>
+                    <D:locktype><D:write/></D:locktype>
+                </D:lockentry>
+            </D:supportedlock>
+            """)
+        }
+        if isDir, let quota {
+            if properties.contains(.quotaAvailable) {
+                lines.append("<D:quota-available-bytes>\(quota.available)</D:quota-available-bytes>")
+            }
+            if properties.contains(.quotaUsed) {
+                lines.append("<D:quota-used-bytes>\(quota.used)</D:quota-used-bytes>")
+            }
+            if properties.contains(.msQuota) {
+                lines.append("<D:quota>\(quota.total)</D:quota>")
+            }
+            if properties.contains(.msQuotaUsed) {
+                lines.append("<D:quotaused>\(quota.used)</D:quotaused>")
+            }
+        }
 
         return """
             <D:response>
-                <D:href>\(href.xmlEscaped)</D:href>
+                <D:href>\(webDAVHref(for: url).xmlEscaped)</D:href>
                 <D:propstat>
                     <D:prop>
-                        <D:resourcetype>\(resourceType)</D:resourcetype>
-                        <D:displayname>\(displayName.xmlEscaped)</D:displayname>
-                        <D:getcontentlength>\(size)</D:getcontentlength>
-                        <D:getlastmodified>\(mtime)</D:getlastmodified>
-                        \(creationProp)
-                        \(contentType)
-                        <D:supportedlock>
-                            <D:lockentry>
-                                <D:lockscope><D:exclusive/></D:lockscope>
-                                <D:locktype><D:write/></D:locktype>
-                            </D:lockentry>
-                        </D:supportedlock>
+                        \(lines.joined(separator: "\n"))
                     </D:prop>
                     <D:status>HTTP/1.1 200 OK</D:status>
                 </D:propstat>
@@ -2291,8 +2514,13 @@ final class ROMUploadServer: @unchecked Sendable {
 
     private func serveWebDAVFile(on connection: NWConnection, request: HTTPRequest, path: String,
                                  includeBody: Bool) {
-        guard !path.isEmpty,
-              let resolved = resolvedPath(path, within: romsDirectory) else {
+        // Finder probes the mount root and folders with GET and HEAD. A 404 fails the probe, and
+        // FileHandle on a directory has no bytes to stream.
+        if path.isEmpty {
+            sendWebDAVCollection(on: connection, request: request)
+            return
+        }
+        guard let resolved = resolvedPath(path, within: romsDirectory) else {
             sendWebDAVResponse(on: connection, status: 404, statusText: "Not Found", request: request)
             return
         }
@@ -2300,8 +2528,14 @@ final class ROMUploadServer: @unchecked Sendable {
         let ioQueue = connectionIOQueue(for: connection)
         Self.diskIOQueue.async { [weak self] in
             guard let self else { return }
-            guard FileManager.default.fileExists(atPath: resolved.path) else {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory) else {
                 let respond = { self.sendWebDAVResponse(on: connection, status: 404, statusText: "Not Found", request: request) }
+                if let ioQueue { ioQueue.async(execute: respond) } else { respond() }
+                return
+            }
+            if isDirectory.boolValue {
+                let respond = { self.sendWebDAVCollection(on: connection, request: request) }
                 if let ioQueue { ioQueue.async(execute: respond) } else { respond() }
                 return
             }
@@ -2346,6 +2580,13 @@ final class ROMUploadServer: @unchecked Sendable {
             }
             if let ioQueue { ioQueue.async(execute: beginStream) } else { beginStream() }
         }
+    }
+
+    private func sendWebDAVCollection(on connection: NWConnection, request: HTTPRequest) {
+        sendRawHeaders(on: connection, status: 200, statusText: "OK", headers: [
+            "Content-Type": "httpd/unix-directory",
+            "Content-Length": "0"
+        ], body: Data(), request: request, isWebDAV: true)
     }
 
     private func handleWebDAVDelete(on connection: NWConnection, request: HTTPRequest, path: String) {
@@ -2609,11 +2850,13 @@ final class ROMUploadServer: @unchecked Sendable {
                                request: request, forceClose: true)
             return
         }
+        guard !webDAVPutIsRefused(on: connection, request: request, target: target) else { return }
+        let overwrote = isExistingFile(target)
         guard let writer = openPutTarget(target, on: connection, request: request, isWebDAV: true) else { return }
         postUploadStarted(path: target.path)
         writer.write(body)
         completeStreamingPut(writer: writer, target: target, truncated: false,
-                            finish: webDAVPutFinish(on: connection, request: request))
+                            finish: webDAVPutFinish(on: connection, request: request, overwrote: overwrote))
     }
 
     // MARK: - Upload Notifications
@@ -2823,7 +3066,17 @@ final class ROMUploadServer: @unchecked Sendable {
     private func sendJSON(on connection: NWConnection, status: Int, json: [String: Any],
                           request: HTTPRequest? = nil, isWebDAV: Bool = false,
                           forceClose: Bool = false) {
-        let data = (try? JSONSerialization.data(withJSONObject: json)) ?? Data()
+        // isValidJSONObject is mandatory, not defensive: a NaN or Inf anywhere in the payload makes
+        // JSONSerialization raise an ObjC NSException, which `try?` does not catch.
+        guard JSONSerialization.isValidJSONObject(json),
+              let data = try? JSONSerialization.data(withJSONObject: json) else {
+            WebServerLog.log(.warning, "JSON response not encodable (NaN or Inf?); answering 500")
+            sendDataResponse(on: connection, status: 500, statusText: "Internal Server Error",
+                             contentType: "application/json",
+                             body: Data(#"{"ok":false,"error":"payload not JSON-encodable"}"#.utf8),
+                             request: request, isWebDAV: isWebDAV, forceClose: forceClose)
+            return
+        }
         sendDataResponse(on: connection, status: status,
                          statusText: status == 200 ? "OK" : "Error",
                          contentType: "application/json", body: data,
@@ -2837,10 +3090,10 @@ final class ROMUploadServer: @unchecked Sendable {
         case .ok(let url):
             return url
         case .lexicalEscape:
-            NSLog("%@", "[ROMUploadServer] rejected path (lexical escape): \(rawPath)")
+            WebServerLog.log(.warning, "rejected path (lexical escape): \(rawPath)")
             return nil
         case .symlinkEscape:
-            NSLog("%@", "[ROMUploadServer] rejected path (symlink escape): \(rawPath)")
+            WebServerLog.log(.warning, "rejected path (symlink escape): \(rawPath)")
             return nil
         }
     }
@@ -2848,7 +3101,10 @@ final class ROMUploadServer: @unchecked Sendable {
     // MARK: - IP Address
 
     func getLocalIPAddress() -> String? {
-        if let cached = cachedIPAddress { return cached }
+        ipAddressLock.lock()
+        let cached = cachedIPAddress
+        ipAddressLock.unlock()
+        if let cached { return cached }
         var address: String?
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
@@ -2867,7 +3123,9 @@ final class ROMUploadServer: @unchecked Sendable {
                 }
             }
         }
+        ipAddressLock.lock()
         cachedIPAddress = address
+        ipAddressLock.unlock()
         return address
     }
 
@@ -2925,12 +3183,12 @@ private final class WebDAVBonjourDelegate: NSObject, NetServiceDelegate {
     var onPublish: (() -> Void)?
 
     func netServiceDidPublish(_ sender: NetService) {
-        NSLog("[ROMUploadServer] _webdav._tcp published on port \(sender.port)")
+        WebServerLog.log(.info, "_webdav._tcp published on port \(sender.port)")
         onPublish?()
     }
 
     func netService(_ sender: NetService, didNotPublish errorDict: [String: NSNumber]) {
-        NSLog("%@", "[ROMUploadServer] _webdav._tcp publish failed: \(errorDict)")
+        WebServerLog.log(.error, "_webdav._tcp publish failed: \(errorDict)")
     }
 }
 #endif
@@ -2963,6 +3221,17 @@ struct HTTPRequest {
     /// Clamped at zero: a negative `Content-Length` from a hostile client used to reach
     /// `Data.dropFirst(_:)`, which traps on a negative count and kills the app remotely.
     var contentLength: Int { max(0, Int(headers["content-length"] ?? "") ?? 0) }
+
+    /// `path` with any run of leading slashes collapsed to one, for matching API routes and
+    /// handing to their handlers. File paths keep using `path`.
+    ///
+    /// A client joining `baseURL.appendingPathComponent("/api/x")` onto a base URL ending in `/`
+    /// asks for `//api/x` on iOS and tvOS 18, where that call still goes through NSURL. An exact
+    /// match missed every route and answered 404, which a discovery client reads as "not there".
+    var routePath: String {
+        guard path.hasPrefix("//") else { return path }
+        return "/" + path.drop { $0 == "/" }
+    }
 
     /// Finder WebDAV PUT uses `Transfer-Encoding: chunked` instead of Content-Length.
     var isChunked: Bool {
@@ -3057,6 +3326,8 @@ final class StreamingMultipartParser: @unchecked Sendable {
     private let endBoundary: Data
     private let outputDirectory: URL
     private let onFileCompleted: ((String) -> Void)?
+    private let preservesSubfolders: Bool
+    private let uploadTransferObserver: (@Sendable () -> (any UploadTransfer)?)?
     private var buffer = Data()
     private var state: ParserState = .seekingBoundary
     private var currentFilename: String?
@@ -3075,11 +3346,29 @@ final class StreamingMultipartParser: @unchecked Sendable {
 
     private enum ParserState { case seekingBoundary, readingHeaders, readingBody, done }
 
-    init(boundary: String, outputDirectory: URL, onFileCompleted: ((String) -> Void)? = nil) {
+    init(preservesSubfolders: Bool = false,
+         uploadTransferObserver: (@Sendable () -> (any UploadTransfer)?)? = nil,
+         boundary: String, outputDirectory: URL, onFileCompleted: ((String) -> Void)? = nil) {
+        self.preservesSubfolders = preservesSubfolders
+        self.uploadTransferObserver = uploadTransferObserver
         self.boundary = Data("--\(boundary)".utf8)
         self.endBoundary = Data("--\(boundary)--".utf8)
         self.outputDirectory = outputDirectory
         self.onFileCompleted = onFileCompleted
+    }
+
+    /// The path a part's `filename` lands at below `outputDirectory`, or nil to drop the part.
+    /// Rejects traversal and hidden components either way.
+    static func sanitizedRelativePath(_ filename: String, preservesSubfolders: Bool) -> String? {
+        let components = filename.split(separator: "/").map(String.init).filter { $0 != "." }
+        guard !components.isEmpty, !components.contains(".."),
+              !components.contains(where: { $0.hasPrefix(".") }) else {
+            guard !preservesSubfolders, let last = components.last, last != "..", !last.hasPrefix(".") else {
+                return nil
+            }
+            return last
+        }
+        return preservesSubfolders ? components.joined(separator: "/") : components.last
     }
 
     func feed(_ data: Data) {
@@ -3135,8 +3424,7 @@ final class StreamingMultipartParser: @unchecked Sendable {
                 currentFilename = extractFilename(from: headersStr)
 
                 if let filename = currentFilename, !filename.isEmpty {
-                    let sanitized = URL(fileURLWithPath: filename).lastPathComponent
-                    guard !sanitized.isEmpty, !sanitized.hasPrefix(".") else {
+                    guard let sanitized = Self.sanitizedRelativePath(filename, preservesSubfolders: preservesSubfolders) else {
                         currentFilename = nil
                         state = .readingBody
                         continue
@@ -3144,9 +3432,11 @@ final class StreamingMultipartParser: @unchecked Sendable {
                     currentFilename = sanitized
                     let filePath = outputDirectory.appendingPathComponent(sanitized)
                     currentFilePath = filePath
-                    currentWriter = SerialFileWriter(at: filePath)
+                    try? FileManager.default.createDirectory(at: filePath.deletingLastPathComponent(),
+                                                             withIntermediateDirectories: true)
+                    currentWriter = SerialFileWriter(at: filePath, transfer: uploadTransferObserver?())
                     if currentWriter == nil {
-                        NSLog("%@", "[ROMUploadServer] multipart: cannot open \(filePath.path) for writing")
+                        WebServerLog.log(.error, "multipart: cannot open \(filePath.path) for writing")
                         hadWriteError = true
                         currentFilename = nil
                         currentFilePath = nil
