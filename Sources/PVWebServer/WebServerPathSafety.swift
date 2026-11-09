@@ -9,11 +9,11 @@
 import Foundation
 
 /// Resolves a client-supplied relative path against a base directory and rejects any path
-/// that escapes the sandbox — lexically (`..`) OR via an on-disk symlink. `internal` so it
-/// can be exercised directly by `PVWebServerTests`.
-enum WebServerPathSafety {
+/// that escapes the sandbox — lexically (`..`) OR via an on-disk symlink. Public so routes an
+/// app registers with `addAsyncHandler` apply the same guard as the built-in handlers.
+public enum WebServerPathSafety {
 
-    enum Resolution: Equatable {
+    public enum Resolution: Equatable {
         /// Path is safely inside the sandbox; carries the (lexically-standardized) URL.
         case ok(URL)
         /// `.`/`..` collapsing lands the path outside the base directory.
@@ -25,7 +25,7 @@ enum WebServerPathSafety {
     /// - Returns: `.ok(url)` with the LEXICAL url (so callers' relative-path/href math is
     ///   unchanged), or a rejection reason. The rejection reasons are distinguished so the
     ///   caller can log which guard fired.
-    static func resolve(_ rawPath: String, within baseDir: URL) -> Resolution {
+    public static func resolve(_ rawPath: String, within baseDir: URL) -> Resolution {
         let lexical = baseDir.appendingPathComponent(rawPath).standardized
         let basePath = baseDir.standardized.path
 

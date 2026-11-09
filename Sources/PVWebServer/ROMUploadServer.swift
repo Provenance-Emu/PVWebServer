@@ -99,6 +99,16 @@ final class ROMUploadServer: @unchecked Sendable {
     /// two devices advertising plain "iCube" collide (NSNetServicesCollisionError, -72001) and the
     /// second one never publishes. PVWebServer sets this to "<title> (<host name>)".
     var bonjourName: String = "iCube"
+    /// Destination of `POST /upload` without a `path` query. `nil` means `romsDirectory`.
+    var defaultUploadDirectory: URL?
+    /// Whether files a WebDAV MOVE lands at also post the upload-completed notification.
+    var reportsWebDAVMovesAsUploads = true
+    private var _unexpectedStopHandler: (@Sendable () -> Void)?
+    /// Called when a listener that reached `.ready` dies without `stop()`.
+    var unexpectedStopHandler: (@Sendable () -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _unexpectedStopHandler }
+        set { lock.lock(); _unexpectedStopHandler = newValue; lock.unlock() }
+    }
 
     // MARK: - State
 
@@ -145,7 +155,9 @@ final class ROMUploadServer: @unchecked Sendable {
         return fmt
     }()
 
-    private var listener: NWListener?
+    /// The listener this server owns. Guarded by `lock` once it is installed: its state handler
+    /// compares against it to tell a dead listener from one it already replaced.
+    private(set) var listener: NWListener?
     #if !os(watchOS)
     private var bonjourWebDAV: NetService?
     private let bonjourDelegate = WebDAVBonjourDelegate()
@@ -300,9 +312,19 @@ final class ROMUploadServer: @unchecked Sendable {
                 case .failed(let error):
                     NSLog("[ROMUploadServer] listener failed on :\(candidate): \(error)")
                     listener?.cancel()
-                    if !resumed { resumed = true; continuation.resume(throwing: error) }
+                    if !resumed {
+                        resumed = true
+                        continuation.resume(throwing: error)
+                    } else if let listener {
+                        self.listenerDied(listener)
+                    }
                 case .cancelled:
-                    if !resumed { resumed = true; continuation.resume(throwing: ROMUploadServerError.initializationFailed) }
+                    if !resumed {
+                        resumed = true
+                        continuation.resume(throwing: ROMUploadServerError.initializationFailed)
+                    } else if let listener {
+                        self.listenerDied(listener)
+                    }
                 default:
                     break
                 }
@@ -321,8 +343,27 @@ final class ROMUploadServer: @unchecked Sendable {
                 continuation.resume(throwing: ROMUploadServerError.bindTimedOut(port: candidate))
             }
         }
+        install(listener, on: candidate)
+    }
+
+    private func install(_ listener: NWListener, on candidate: UInt16) {
+        lock.lock(); defer { lock.unlock() }
         port = candidate
         self.listener = listener
+    }
+
+    /// A listener stopped by itself. iOS does this to the sockets of a suspended app, and the
+    /// port may have gone to another app since, so take everything down (no Bonjour record may
+    /// keep naming it) and let the owner decide to start again. A listener `stop()` already
+    /// dropped, or one a timed-out bind abandoned, is not the current one and is ignored.
+    private func listenerDied(_ dead: NWListener) {
+        lock.lock()
+        guard listener === dead else { lock.unlock(); return }
+        let handler = _unexpectedStopHandler
+        lock.unlock()
+        NSLog("[ROMUploadServer] listener stopped unexpectedly; taking the server down")
+        stop()
+        handler?()
     }
 
     private func advertiseWebDAV(on candidate: UInt16) {
@@ -371,12 +412,16 @@ final class ROMUploadServer: @unchecked Sendable {
         lock.lock()
         let conns = activeConnections
         let contexts = connectionContexts
+        let stoppedListener = listener
         #if !os(watchOS)
         let webDAVService = bonjourWebDAV
         #endif
         activeConnections.removeAll()
         connectionContexts.removeAll()
         _bonjourServerURL = nil
+        // Cleared before the cancel below, so its `.cancelled` callback reads as a requested stop.
+        listener = nil
+        port = 0
         #if !os(watchOS)
         bonjourWebDAV = nil
         #endif
@@ -384,14 +429,12 @@ final class ROMUploadServer: @unchecked Sendable {
 
         for ctx in contexts.values { ctx.watchdog?.cancel() }
         for conn in conns.values { conn.cancel() }
-        listener?.cancel()
-        listener = nil
+        stoppedListener?.cancel()
         #if !os(watchOS)
         if let webDAVService {
             DispatchQueue.main.async { webDAVService.stop() }
         }
         #endif
-        port = 0
         cachedIPAddress = nil
         NSLog("[ROMUploadServer] stopped")
     }
@@ -1146,6 +1189,24 @@ final class ROMUploadServer: @unchecked Sendable {
                                   contentType: response.contentType,
                                   extraHeaders: response.headers,
                                   on: connection, request: request, isWebDAV: isWebDAV)
+        case .stream(let produce):
+            var header = "HTTP/1.1 \(response.status) \(statusText)\r\n"
+            header += "Content-Type: \(response.contentType)\r\n"
+            for (key, value) in response.headers { header += "\(key): \(value)\r\n" }
+            header += "Connection: close\r\n\r\n"
+            let send: @Sendable (Data) async -> Bool = { data in
+                await withCheckedContinuation { continuation in
+                    connection.send(content: data, completion: .contentProcessed { error in
+                        continuation.resume(returning: error == nil)
+                    })
+                }
+            }
+            Task {
+                if await send(Data(header.utf8)) {
+                    await produce(WebRouteStreamWriter(send: send))
+                }
+                connection.cancel()
+            }
         }
     }
 
@@ -1531,6 +1592,7 @@ final class ROMUploadServer: @unchecked Sendable {
             guard let self else { return }
             do {
                 try FileManager.default.removeItem(at: resolved)
+                self.postDeleted(resolved)
                 let respond = { self.sendJSON(on: connection, status: 200, json: ["ok": true], request: request, isWebDAV: false) }
                 if let ioQueue { ioQueue.async(execute: respond) } else { respond() }
             } catch {
@@ -1634,7 +1696,11 @@ final class ROMUploadServer: @unchecked Sendable {
     }
 
     private func uploadDirectory(for request: HTTPRequest) -> URL {
-        guard let raw = request.queryParameters["path"], !raw.isEmpty else { return romsDirectory }
+        guard let raw = request.queryParameters["path"], !raw.isEmpty else {
+            guard let defaultUploadDirectory else { return romsDirectory }
+            try? FileManager.default.createDirectory(at: defaultUploadDirectory, withIntermediateDirectories: true)
+            return defaultUploadDirectory
+        }
         let decoded = (raw.removingPercentEncoding ?? raw)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard !decoded.isEmpty, let resolved = resolvedPath(decoded, within: romsDirectory) else {
@@ -1684,6 +1750,7 @@ final class ROMUploadServer: @unchecked Sendable {
                 return
             }
             try fm.moveItem(at: source, to: target)
+            postMoved(from: source, to: target)
             sendJSON(on: connection, status: 200, json: ["ok": true], request: request, isWebDAV: false)
         } catch {
             sendJSON(on: connection, status: 500, json: ["ok": false, "error": error.localizedDescription],
@@ -1706,6 +1773,7 @@ final class ROMUploadServer: @unchecked Sendable {
         }
         do {
             try FileManager.default.createDirectory(at: resolved, withIntermediateDirectories: true)
+            postFolderCreated(resolved)
             sendJSON(on: connection, status: 200, json: ["ok": true], request: request, isWebDAV: false)
         } catch {
             sendJSON(on: connection, status: 500, json: ["ok": false, "error": error.localizedDescription],
@@ -2280,6 +2348,7 @@ final class ROMUploadServer: @unchecked Sendable {
             guard let self else { return }
             do {
                 try FileManager.default.removeItem(at: resolved)
+                self.postDeleted(resolved)
                 let respond = { self.sendWebDAVResponse(on: connection, status: 204, statusText: "No Content", request: request) }
                 if let ioQueue { ioQueue.async(execute: respond) } else { respond() }
             } catch {
@@ -2300,6 +2369,7 @@ final class ROMUploadServer: @unchecked Sendable {
             guard let self else { return }
             do {
                 try FileManager.default.createDirectory(at: resolved, withIntermediateDirectories: true)
+                self.postFolderCreated(resolved)
                 let respond = { self.sendWebDAVResponse(on: connection, status: 201, statusText: "Created", request: request) }
                 if let ioQueue { ioQueue.async(execute: respond) } else { respond() }
             } catch {
@@ -2380,7 +2450,10 @@ final class ROMUploadServer: @unchecked Sendable {
             switch self.performWebDAVFilesystemTransfer(copy: copy, source: source,
                                                         destination: destination, overwrite: overwrite) {
             case .success:
-                self.notifyWebDAVResourceChanged(at: destination)
+                if !copy { self.postMoved(from: source, to: destination) }
+                if copy || self.reportsWebDAVMovesAsUploads {
+                    self.notifyWebDAVResourceChanged(at: destination)
+                }
                 let respond = { self.sendWebDAVResponse(on: connection, status: 204, statusText: "No Content", request: request) }
                 if let ioQueue { ioQueue.async(execute: respond) } else { respond() }
             case .failure(.preconditionFailed):
@@ -2550,6 +2623,32 @@ final class ROMUploadServer: @unchecked Sendable {
         NotificationCenter.default.post(
             name: Notification.Name(PVWebServerFileUploadCompletedNotificationName),
             object: nil, userInfo: ["filePath": filePath, "fileSize": fileSize]
+        )
+    }
+
+    // MARK: - File Change Notifications
+
+    /// Finder's `._` sidecars and `.DS_Store` come and go with every copy. Nobody tracks them,
+    /// and they are dropped on upload anyway.
+    private func postDeleted(_ url: URL) {
+        if Self.isMetadataSidecar(url) { return }
+        NotificationCenter.default.post(
+            name: Notification.Name(PVWebServerFileDeletedNotificationName),
+            object: nil, userInfo: ["filePath": url.path]
+        )
+    }
+
+    private func postMoved(from source: URL, to destination: URL) {
+        NotificationCenter.default.post(
+            name: Notification.Name(PVWebServerFileMovedNotificationName),
+            object: nil, userInfo: ["fromPath": source.path, "toPath": destination.path]
+        )
+    }
+
+    private func postFolderCreated(_ url: URL) {
+        NotificationCenter.default.post(
+            name: Notification.Name(PVWebServerFolderCreatedNotificationName),
+            object: nil, userInfo: ["filePath": url.path]
         )
     }
 
