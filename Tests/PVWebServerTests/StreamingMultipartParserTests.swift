@@ -45,6 +45,52 @@ final class StreamingMultipartParserTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("Wii/game.rvz").path))
     }
 
+    func testSubfolderPreservedWhenAsked() throws {
+        let parser = StreamingMultipartParser(preservesSubfolders: true, boundary: "B1", outputDirectory: dir)
+        parser.feed(multipart(boundary: "B1", filename: "meltybld/gdl-0028c.chd", body: Data("x".utf8)))
+        finalize(parser)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent("meltybld/gdl-0028c.chd").path))
+    }
+
+    func testTraversalIsRefusedWhenPreservingSubfolders() throws {
+        let parser = StreamingMultipartParser(preservesSubfolders: true, boundary: "B2", outputDirectory: dir)
+        parser.feed(multipart(boundary: "B2", filename: "a/../../escape.bin", body: Data("x".utf8)))
+        finalize(parser)
+        XCTAssertTrue(parser.completedFiles.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dir.deletingLastPathComponent().appendingPathComponent("escape.bin").path))
+    }
+
+    /// A symlink inside the upload folder must not carry an upload outside it.
+    func testSymlinkedSubfolderIsRefused() throws {
+        let outside = try makeOutsideDirectory()
+        try FileManager.default.createSymbolicLink(at: dir.appendingPathComponent("link"), withDestinationURL: outside)
+        let parser = StreamingMultipartParser(preservesSubfolders: true, boundary: "B3", outputDirectory: dir)
+        parser.feed(multipart(boundary: "B3", filename: "link/new.bin", body: Data("x".utf8)))
+        finalize(parser)
+        XCTAssertTrue(parser.completedFiles.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("new.bin").path))
+    }
+
+    func testSymlinkedFileIsRefusedWhenFlattening() throws {
+        let outside = try makeOutsideDirectory()
+        let victim = outside.appendingPathComponent("victim.bin")
+        try Data("original".utf8).write(to: victim)
+        try FileManager.default.createSymbolicLink(at: dir.appendingPathComponent("victim.bin"), withDestinationURL: victim)
+        let parser = StreamingMultipartParser(boundary: "B4", outputDirectory: dir)
+        parser.feed(multipart(boundary: "B4", filename: "victim.bin", body: Data("overwritten".utf8)))
+        finalize(parser)
+        XCTAssertTrue(parser.completedFiles.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: victim), Data("original".utf8))
+    }
+
+    private func makeOutsideDirectory() throws -> URL {
+        let outside = FileManager.default.temporaryDirectory.appendingPathComponent("pvweb-outside-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: outside) }
+        return outside
+    }
+
     func testTraversalFilenameNotWrittenOutsideDir() throws {
         let parser = StreamingMultipartParser(boundary: "B2", outputDirectory: dir)
         parser.feed(multipart(boundary: "B2", filename: "../escape.bin", body: Data("x".utf8)))

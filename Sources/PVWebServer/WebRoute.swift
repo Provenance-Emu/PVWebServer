@@ -165,6 +165,34 @@ public struct WebRouteResponse: Sendable {
     }
 }
 
+// MARK: - Upload page and transfers
+
+/// What `ROMUploadServer.uploadPageRenderer` needs to draw the upload page.
+public struct UploadPageContext: Sendable {
+    public let ipAddress: String
+    /// Empty for port 80, otherwise `:<port>`.
+    public let portSuffix: String
+    /// The table rows for the folder being browsed, already HTML-escaped.
+    public let fileRows: String
+    /// The browsed folder, relative to the root; empty for the root. Not escaped.
+    public let currentPath: String
+
+    public init(ipAddress: String, portSuffix: String, fileRows: String, currentPath: String) {
+        self.ipAddress = ipAddress
+        self.portSuffix = portSuffix
+        self.fileRows = fileRows
+        self.currentPath = currentPath
+    }
+}
+
+/// One uploaded file on its way to disk. See `ROMUploadServer.uploadTransferObserver`.
+public protocol UploadTransfer: Sendable {
+    /// Called once per write, on that file's writer queue, so keep it short.
+    func didWrite(byteCount: Int)
+    /// Called once, when the file closes or could not be opened.
+    func didEnd()
+}
+
 // MARK: - Registration seam
 
 public typealias WebRouteHandler = @Sendable (WebRouteRequest) async -> WebRouteResponse
@@ -188,9 +216,12 @@ public protocol WebRouteRegistering: Sendable {
 ///   * First registration wins. Re-registering the same method+path is a no-op
 ///     rather than a silent replacement — a double `activate()` must not swap a
 ///     live handler out from under an in-flight request.
+///   * An exact route beats a prefix route, whatever the registration order. A
+///     prefix route matches paths strictly below it, on a segment boundary, and
+///     the longest prefix wins.
 ///
-/// No wildcards or path parameters: every continuity route addresses its
-/// subject through the query string, and a pattern language nobody needs is a
+/// No wildcards or path parameters: a route addresses its subject through the
+/// query string or its last segments, and a pattern language nobody needs is a
 /// path-traversal surface nobody audits.
 struct WebRouteTable: Sendable {
     private struct Entry {
@@ -200,6 +231,7 @@ struct WebRouteTable: Sendable {
     }
 
     private var entries: [Entry] = []
+    private var prefixEntries: [Entry] = []
 
     init() {}
 
@@ -216,10 +248,35 @@ struct WebRouteTable: Sendable {
         return true
     }
 
+    /// Returns `true` if the route was added, `false` if an identical
+    /// method+prefix was already registered (first registration wins).
+    @discardableResult
+    mutating func register(method: String, pathPrefix: String, handler: @escaping WebRouteHandler) -> Bool {
+        let normalizedMethod = method.uppercased()
+        let normalizedPrefix = Self.normalize(path: pathPrefix)
+        guard !prefixEntries.contains(where: { $0.method == normalizedMethod && $0.path == normalizedPrefix }) else {
+            return false
+        }
+        prefixEntries.append(Entry(method: normalizedMethod, path: normalizedPrefix, handler: handler))
+        return true
+    }
+
     func handler(forMethod method: String, path: String) -> WebRouteHandler? {
         let normalizedMethod = method.uppercased()
         let normalizedPath = Self.normalize(path: path)
-        return entries.first { $0.method == normalizedMethod && $0.path == normalizedPath }?.handler
+        if let exact = entries.first(where: { $0.method == normalizedMethod && $0.path == normalizedPath }) {
+            return exact.handler
+        }
+        return prefixEntries
+            .filter { $0.method == normalizedMethod && Self.path(normalizedPath, isBelow: $0.path) }
+            .max { $0.path.count < $1.path.count }?
+            .handler
+    }
+
+    /// Matches on a segment boundary. The root is its own case: normalizing keeps its slash, so
+    /// appending one more would only match paths that start with `//`.
+    private static func path(_ path: String, isBelow prefix: String) -> Bool {
+        prefix == "/" ? path.count > 1 : path.hasPrefix(prefix + "/")
     }
 
     /// True when any method is registered at this path. Lets the server answer

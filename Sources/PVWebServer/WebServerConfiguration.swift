@@ -29,6 +29,18 @@ public struct WebServerConfiguration: Sendable {
     /// if uploads are what drives your library rescan; turn off if you handle the moved
     /// notification, or a rename looks like a new file arriving.
     public var reportsWebDAVMovesAsUploads: Bool
+    /// Publish `_webdav._tcp` alongside the listener's `_http._tcp`. Turn it off when the app
+    /// advertises WebDAV itself: two registrations of one name and type collide with -72001.
+    public var advertisesWebDAVService: Bool
+    /// Keep the sender's folder path in multipart uploads ("set/disc.chd" lands in `set/`) rather
+    /// than flattening to the file name. Traversal and hidden components are refused either way.
+    public var preservesMultipartSubfolders: Bool
+    /// Replaces the bundled upload page at `GET /`, keeping the folder listing the server builds.
+    /// Called off the main thread, possibly from several connections at once.
+    public var uploadPageRenderer: (@Sendable (UploadPageContext) -> String)?
+    /// Called once per uploaded file when its writer opens. Return a transfer to observe the
+    /// bytes reaching disk, or nil to skip this file.
+    public var uploadTransferObserver: (@Sendable () -> (any UploadTransfer)?)?
 
     public init(
         rootDirectory: URL,
@@ -37,7 +49,11 @@ public struct WebServerConfiguration: Sendable {
         bonjourName: String? = nil,
         preferredPorts: [Int] = [],
         bridgesUploadsToLibraryRescan: Bool = false,
-        reportsWebDAVMovesAsUploads: Bool = true
+        reportsWebDAVMovesAsUploads: Bool = true,
+        advertisesWebDAVService: Bool = true,
+        preservesMultipartSubfolders: Bool = false,
+        uploadPageRenderer: (@Sendable (UploadPageContext) -> String)? = nil,
+        uploadTransferObserver: (@Sendable () -> (any UploadTransfer)?)? = nil
     ) {
         self.rootDirectory = rootDirectory
         self.defaultUploadDirectory = defaultUploadDirectory
@@ -46,5 +62,9 @@ public struct WebServerConfiguration: Sendable {
         self.preferredPorts = preferredPorts
         self.bridgesUploadsToLibraryRescan = bridgesUploadsToLibraryRescan
         self.reportsWebDAVMovesAsUploads = reportsWebDAVMovesAsUploads
+        self.advertisesWebDAVService = advertisesWebDAVService
+        self.preservesMultipartSubfolders = preservesMultipartSubfolders
+        self.uploadPageRenderer = uploadPageRenderer
+        self.uploadTransferObserver = uploadTransferObserver
     }
 }
