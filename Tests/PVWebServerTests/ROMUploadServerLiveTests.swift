@@ -220,6 +220,35 @@ final class ROMUploadServerLiveTests: XCTestCase {
         XCTAssertEqual(Set(results.snapshot.map(\.id)).count, 2)
     }
 
+    func testMultipartWaitsForContinueBeforeSendingBody() async throws {
+        try await assertMultipartContinue(chunked: false)
+    }
+
+    func testChunkedMultipartWaitsForContinueBeforeSendingBody() async throws {
+        try await assertMultipartContinue(chunked: true)
+    }
+
+    private func assertMultipartContinue(chunked: Bool) async throws {
+        try await server.start()
+        let body = Data(("--test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"file.txt\""
+            + "\r\n\r\nPOST\r\n--test--\r\n").utf8)
+        let framing = chunked ? "Transfer-Encoding: chunked" : "Content-Length: \(body.count)"
+        let headers = "POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"
+            + "User-Agent: \(Self.browserAgent)\r\nContent-Type: multipart/form-data; boundary=test\r\n"
+            + "Expect: 100-continue\r\n\(framing)\r\n\r\n"
+        var wireBody = body
+        if chunked {
+            wireBody = Data("\(String(body.count, radix: 16))\r\n".utf8) + body + Data("\r\n0\r\n\r\n".utf8)
+        }
+        let bytes = try await RawClient.exchange(
+            port: server.boundPort, request: Data(headers.utf8), bodyAfterContinue: wireBody, timeout: 2
+        )
+        let reply = try XCTUnwrap(String(data: bytes, encoding: .utf8))
+        XCTAssertTrue(reply.hasPrefix("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n"), reply)
+        XCTAssertTrue(reply.contains("\"uploaded\":1"), reply)
+        XCTAssertEqual(try fileText("file.txt"), "POST")
+    }
+
     private final class UploadResults: @unchecked Sendable {
         private let lock = NSLock()
         private var results: [UploadResult] = []
@@ -425,12 +454,14 @@ private final class ResultBox: @unchecked Sendable {
 
 /// One request, then everything the server sends until it closes or `timeout` passes.
 private enum RawClient {
-    static func exchange(port: UInt16, request: Data, timeout: TimeInterval = 5) async throws -> Data {
+    static func exchange(port: UInt16, request: Data, bodyAfterContinue: Data? = nil,
+                         timeout: TimeInterval = 5) async throws -> Data {
         let endpointPort = try XCTUnwrap(NWEndpoint.Port(rawValue: port))
         return try await withCheckedThrowingContinuation { continuation in
             let queue = DispatchQueue(label: "raw-client")
             let connection = NWConnection(host: "127.0.0.1", port: endpointPort, using: .tcp)
             var received = Data()
+            var bodySent = false
             var finished = false
             func finish(_ result: Result<Data, Error>) {
                 guard !finished else { return }
@@ -440,7 +471,21 @@ private enum RawClient {
             }
             func read() {
                 connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { data, _, isComplete, error in
+                    if finished { return }
                     if let data { received.append(data) }
+                    if !bodySent, let bodyAfterContinue,
+                       received.range(of: Data("\r\n\r\n".utf8)) != nil {
+                        guard received.starts(with: Data("HTTP/1.1 100 Continue\r\n\r\n".utf8)) else {
+                            finish(.failure(NSError(domain: "RawClient", code: 2,
+                                                    userInfo: [NSLocalizedDescriptionKey: "expected 100 Continue"])))
+                            return
+                        }
+                        bodySent = true
+                        connection.send(content: bodyAfterContinue, completion: .contentProcessed { error in
+                            if let error { finish(.failure(error)) } else { read() }
+                        })
+                        return
+                    }
                     if isComplete || error != nil {
                         finish(.success(received))
                     } else {
