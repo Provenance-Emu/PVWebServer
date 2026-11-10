@@ -823,8 +823,15 @@ final class ROMUploadServer: @unchecked Sendable {
     ) {
         if !isWebDAV && request.method == "POST" && request.path.hasPrefix("/upload") {
             if let boundary = request.multipartBoundary {
-                streamMultipartUpload(on: connection, request: request, boundary: boundary,
-                                      initialBody: initialBody, remaining: remaining)
+                let beginUpload: () -> Void = { [weak self] in
+                    self?.streamMultipartUpload(on: connection, request: request, boundary: boundary,
+                                                initialBody: initialBody, remaining: remaining)
+                }
+                if request.expectsContinue {
+                    sendContinue(on: connection, isWebDAV: false, request: request, then: beginUpload)
+                } else {
+                    beginUpload()
+                }
                 return
             }
         }
@@ -951,6 +958,19 @@ final class ROMUploadServer: @unchecked Sendable {
             return
         }
 
+        let beginBody: () -> Void = { [weak self] in
+            self?.receiveBufferedChunkedBody(on: connection, request: request, isWebDAV: isWebDAV,
+                                            initial: initial)
+        }
+        if request.expectsContinue {
+            sendContinue(on: connection, isWebDAV: isWebDAV, request: request, then: beginBody)
+        } else {
+            beginBody()
+        }
+    }
+
+    private func receiveBufferedChunkedBody(on connection: NWConnection, request: HTTPRequest,
+                                            isWebDAV: Bool, initial: Data) {
         accumulateChunkedBody(on: connection, initial: initial) { [weak self] outcome in
             guard let self else { return }
             let body: Data
