@@ -41,6 +41,9 @@ public struct WebServerConfiguration: Sendable {
     /// Called once per uploaded file when its writer opens. Return a transfer to observe the
     /// bytes reaching disk, or nil to skip this file.
     public var uploadTransferObserver: (@Sendable () -> (any UploadTransfer)?)?
+    /// One result per accepted file target, including failed opens. Called off the main
+    /// thread after publication or cleanup. Keep it short and thread-safe.
+    public var onUploadResult: (@Sendable (UploadResult) -> Void)?
 
     public init(
         rootDirectory: URL,
@@ -53,7 +56,8 @@ public struct WebServerConfiguration: Sendable {
         advertisesWebDAVService: Bool = true,
         preservesMultipartSubfolders: Bool = false,
         uploadPageRenderer: (@Sendable (UploadPageContext) -> String)? = nil,
-        uploadTransferObserver: (@Sendable () -> (any UploadTransfer)?)? = nil
+        uploadTransferObserver: (@Sendable () -> (any UploadTransfer)?)? = nil,
+        onUploadResult: (@Sendable (UploadResult) -> Void)? = nil
     ) {
         self.rootDirectory = rootDirectory
         self.defaultUploadDirectory = defaultUploadDirectory
@@ -66,5 +70,6 @@ public struct WebServerConfiguration: Sendable {
         self.preservesMultipartSubfolders = preservesMultipartSubfolders
         self.uploadPageRenderer = uploadPageRenderer
         self.uploadTransferObserver = uploadTransferObserver
+        self.onUploadResult = onUploadResult
     }
 }

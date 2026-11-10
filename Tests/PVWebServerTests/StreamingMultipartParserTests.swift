@@ -113,6 +113,16 @@ final class StreamingMultipartParserTests: XCTestCase {
         XCTAssertTrue(written.allSatisfy { $0 == 0x41 })
     }
 
+    func testDelimiterSuffixCanSpanReads() throws {
+        let parser = StreamingMultipartParser(boundary: "B", outputDirectory: dir)
+        let content = Data("a\r\n--Bxz inside the file".utf8)
+        let full = multipart(boundary: "B", filename: "split.bin", body: content)
+        for byte in full { parser.feed(Data([byte])) }
+        finalize(parser)
+        XCTAssertFalse(parser.hadWriteError)
+        XCTAssertEqual(try Data(contentsOf: dir.appendingPathComponent("split.bin")), content)
+    }
+
     func testWriteFailureIsSurfacedAndFileNotCompleted() throws {
         // A read-only output directory makes createFile fail: writer is nil, part is skipped,
         // but hadWriteError must still be reported so the caller answers 5xx.
@@ -155,6 +165,21 @@ final class StreamingMultipartParserTests: XCTestCase {
         XCTAssertTrue(parser.completedFiles.isEmpty, "a truncated upload must not be announced as completed")
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("half.iso").path),
                        "the partial file must be deleted")
+    }
+
+    func testIncompleteReplacementPreservesExistingFile() throws {
+        let target = dir.appendingPathComponent("game.iso")
+        let original = Data("original".utf8)
+        try original.write(to: target)
+        let parser = StreamingMultipartParser(boundary: "B5", outputDirectory: dir)
+        let full = multipart(boundary: "B5", filename: "game.iso", body: Data(repeating: 0x42, count: 4096))
+        parser.feed(Data(full.prefix(full.count / 2)))
+        finalize(parser)
+
+        XCTAssertTrue(parser.hadWriteError)
+        XCTAssertTrue(parser.completedFiles.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: target), original)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), ["game.iso"])
     }
 
     func testTruncatedBodyDoesNotFireOnFileCompleted() throws {
