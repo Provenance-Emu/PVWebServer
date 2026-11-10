@@ -60,23 +60,27 @@ final class SerialFileWriter: @unchecked Sendable {
         }
     }
 
-    func finalize(completion: @escaping @Sendable () -> Void) {
-        queue.async {
+    func close() {
+        queue.sync {
             do {
-                try self.handle.close()
+                try handle.close()
             } catch {
-                if !self.failed { self.recordFailure(error, context: "close") }
+                if !failed { recordFailure(error, context: "close") }
             }
-            self.transfer?.didEnd()
-            DispatchQueue.global(qos: .userInitiated).async(execute: completion)
+            transfer?.didEnd()
+        }
+    }
+
+    func finalize(completion: @escaping @Sendable () -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.close()
+            completion()
         }
     }
 
     private func recordFailure(_ error: Error, context: String) {
         failed = true
-        let ns = error as NSError
-        let underlying = (ns.userInfo[NSUnderlyingErrorKey] as? NSError)?.code
-        if ns.code == Int(ENOSPC) || underlying == Int(ENOSPC) { diskFull = true }
+        diskFull = UploadFailure.diskFailure(error) == .diskFull
         WebServerLog.log(.error, "upload \(context) failed\(diskFull ? " (disk full)" : ""): \(error)")
     }
 }

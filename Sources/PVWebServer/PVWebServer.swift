@@ -126,6 +126,7 @@ public final class PVWebServer: NSObject, @unchecked Sendable {
         self.server.preservesMultipartSubfolders = configuration.preservesMultipartSubfolders
         self.server.uploadPageRenderer = configuration.uploadPageRenderer
         self.server.uploadTransferObserver = configuration.uploadTransferObserver
+        self.server.onUploadResult = configuration.onUploadResult
         self.preferredPorts = configuration.preferredPorts
 
         guard configuration.bridgesUploadsToLibraryRescan else { return }

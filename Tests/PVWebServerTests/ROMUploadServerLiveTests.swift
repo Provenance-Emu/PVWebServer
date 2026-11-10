@@ -181,6 +181,56 @@ final class ROMUploadServerLiveTests: XCTestCase {
         XCTAssertEqual(try fileText("file.txt"), "new")
     }
 
+    func testInterruptedOverwriteLeavesExistingFileIntact() async throws {
+        let results = UploadResults()
+        let ended = expectation(description: "cancelled upload reported")
+        server.onUploadResult = { result in
+            results.append(result)
+            ended.fulfill()
+        }
+        try await server.start()
+        let request = "PUT /file.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+            + "User-Agent: \(Self.webDAVAgent)\r\nContent-Length: 12\r\n\r\npart"
+        _ = try await RawClient.exchange(port: server.boundPort, request: Data(request.utf8), timeout: 0.5)
+        await fulfillment(of: [ended], timeout: 5)
+        XCTAssertEqual(results.snapshot.map(\.outcome), [.cancelled])
+        XCTAssertEqual(results.snapshot.map(\.bytesWritten), [4])
+        XCTAssertEqual(try fileText("file.txt"), "old")
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: root.path)), ["file.txt", "Folder"])
+    }
+
+    func testReportsCommittedPutAndMultipartOutcomes() async throws {
+        let results = UploadResults()
+        server.onUploadResult = { results.append($0) }
+        try await server.start()
+
+        let put = try await webDAV("PUT", "/file.txt", body: "PUT")
+        XCTAssertEqual(put.status, 204)
+        let body = "--test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"file.txt\""
+            + "\r\n\r\nPOST\r\n--test--\r\n"
+        let post = try await send("POST", "/upload", headers: [
+            "User-Agent": Self.browserAgent, "Content-Type": "multipart/form-data; boundary=test"
+        ], body: body)
+
+        XCTAssertEqual(post.status, 200)
+        XCTAssertEqual(try fileText("file.txt"), "POST")
+        XCTAssertEqual(results.snapshot.map(\.outcome), [.completed, .completed])
+        XCTAssertEqual(results.snapshot.map(\.bytesWritten), [3, 4])
+        XCTAssertEqual(results.snapshot.map { $0.destination.lastPathComponent }, ["file.txt", "file.txt"])
+        XCTAssertEqual(Set(results.snapshot.map(\.id)).count, 2)
+    }
+
+    private final class UploadResults: @unchecked Sendable {
+        private let lock = NSLock()
+        private var results: [UploadResult] = []
+
+        func append(_ result: UploadResult) {
+            lock.withLock { results.append(result) }
+        }
+
+        var snapshot: [UploadResult] { lock.withLock { results } }
+    }
+
     func testBrowserPutStillWorks() async throws {
         try await server.start()
         let reply = try await send("PUT", "/files/browser.bin", headers: ["User-Agent": Self.browserAgent], body: "abc")

@@ -58,6 +58,37 @@ Routes see `//api/x` as `/api/x`: iOS and tvOS 18 NSURL produce that path when j
 onto a base URL ending in a slash. Routes run for WebDAV clients too, so an app can
 put access control in a route. The WebDAV file layer itself allows anonymous access.
 
+### Upload outcomes and replacement
+
+Set `WebServerConfiguration.onUploadResult` to receive a terminal result for
+each accepted PUT target or multipart file part. It contains a transfer ID,
+destination, bytes written, and an outcome. Only `.completed` means a file
+was published. A Finder metadata upload can finish as `.discardedMetadata`.
+Requests rejected before a file transfer, such as an invalid path, do not
+produce a result. The byte observer and existing notifications remain available.
+
+The server stages uploads in the destination directory and atomically renames
+them after a complete body and a successful close. A failed replacement
+leaves the original file intact. Multipart requests commit each complete file
+part separately. A later failed part does not roll back earlier files.
+
+## Transfer benchmark
+
+Use the same script against either server version. Pass its URL or the exact
+Bonjour instance name.
+
+```sh
+Scripts/webserver_transfer_bench.sh --url http://127.0.0.1:8080/ --sizes 256k,8m,64m --runs 5 --download
+Scripts/webserver_transfer_bench.sh --service "iFly EMU" --runs 5 --replace --download --json
+```
+
+The script compares WebDAV PUT, browser PUT, and multipart POST, with optional
+browser GET. `--replace` seeds each destination before timing replacements.
+Use an isolated test library because the server can import uploads. Each run
+uses its own folder and removes it at exit unless `--no-cleanup` is passed.
+Keep the device, network, payloads, and gameplay state the same for comparisons.
+The reported rate is wire Mbps, including multipart framing for POST.
+
 The original GPL-2.0-or-later source notices are retained; see COPYING.
 
 ## Precompiled XCFramework

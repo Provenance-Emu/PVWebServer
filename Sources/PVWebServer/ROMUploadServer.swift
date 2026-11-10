@@ -127,6 +127,7 @@ final class ROMUploadServer: @unchecked Sendable {
     /// Called once per uploaded file when its writer opens. Return a transfer to observe the
     /// bytes reaching disk, or nil to skip this file. Set before `start()`.
     var uploadTransferObserver: (@Sendable () -> (any UploadTransfer)?)?
+    var onUploadResult: (@Sendable (UploadResult) -> Void)?
 
     /// Keep the sender's folder path in multipart uploads ("set/disc.chd" lands in `set/`) rather
     /// than flattening to the file name. Set before `start()`.
@@ -1145,9 +1146,10 @@ final class ROMUploadServer: @unchecked Sendable {
         invalidatePropfindCache()
         guard let target = resolvePutTarget(on: connection, request: request, isWebDAV: isWebDAV) else { return }
         let overwrote = isExistingFile(target)
-        guard let writer = openPutTarget(target, on: connection, request: request, isWebDAV: isWebDAV) else { return }
+        guard let upload = openPutTarget(target, on: connection, request: request, isWebDAV: isWebDAV) else { return }
         postUploadStarted(path: target.path)
         let reader = ChunkedBodyReader()
+        let overwrite = !isWebDAV || webDAVOverwriteAllowed(request)
         let finish = putFinish(on: connection, request: request, isWebDAV: isWebDAV, overwrote: overwrote)
 
         let finishSuccess: (Data) -> Void = { [weak self] trailing in
@@ -1161,25 +1163,19 @@ final class ROMUploadServer: @unchecked Sendable {
                 }
                 self.lock.unlock()
             }
-            self.completeStreamingPut(writer: writer, target: target, truncated: false, finish: finish)
+            self.completePut(upload, overwrite: overwrite, finish: finish)
         }
 
         func handleEvents(_ events: [ChunkedBodyReader.Event]) -> Bool {
             for event in events {
                 switch event {
                 case .payload(let chunk):
-                    if !chunk.isEmpty { writer.write(chunk) }
+                    upload.write(chunk)
                 case .complete(let trailing):
                     finishSuccess(trailing)
                     return true
                 case .invalid:
-                    writer.finalize { [weak self] in
-                        guard let self else { return }
-                        WebServerLog.log(.error, "upload FAILED for \(target.lastPathComponent): invalid chunked body after \(writer.bytesWritten) bytes — deleting partial file")
-                        try? FileManager.default.removeItem(at: target)
-                        self.sendPutBadRequest(on: connection, request: request, isWebDAV: isWebDAV,
-                                               reason: "Invalid chunked body")
-                    }
+                    self.completePut(upload, failure: .invalidBody, overwrite: overwrite, finish: finish)
                     return true
                 }
             }
@@ -1193,13 +1189,13 @@ final class ROMUploadServer: @unchecked Sendable {
                 [weak self] data, _, isComplete, error in
                 guard let self else { return }
                 if error != nil {
-                    self.completeStreamingPut(writer: writer, target: target, truncated: true, finish: finish)
+                    self.completePut(upload, failure: .truncated, overwrite: overwrite, finish: finish)
                     return
                 }
                 let events = reader.feed(data ?? Data())
                 if handleEvents(events) { return }
                 if isComplete {
-                    self.completeStreamingPut(writer: writer, target: target, truncated: true, finish: finish)
+                    self.completePut(upload, failure: .truncated, overwrite: overwrite, finish: finish)
                     return
                 }
                 readMore()
@@ -1766,9 +1762,13 @@ final class ROMUploadServer: @unchecked Sendable {
         let parser = StreamingMultipartParser(
             preservesSubfolders: preservesMultipartSubfolders,
             uploadTransferObserver: uploadTransferObserver,
+            onUploadResult: onUploadResult,
             boundary: boundary,
             outputDirectory: uploadDirectory(for: request),
-            onFileCompleted: { [weak self] path in self?.postUploadCompleted(filePath: path) }
+            onFileCompleted: { [weak self] path in
+                self?.invalidatePropfindCache()
+                self?.postUploadCompleted(filePath: path)
+            }
         )
         parser.feed(initialBody)
 
@@ -1812,8 +1812,8 @@ final class ROMUploadServer: @unchecked Sendable {
 
     private func finishMultipartUpload(on connection: NWConnection, request: HTTPRequest,
                                        parser: StreamingMultipartParser) {
-        if parser.hadWriteError {
-            sendJSON(on: connection, status: 500, json: ["ok": false, "error": "Upload failed"],
+        if let failure = parser.failure {
+            sendJSON(on: connection, status: failure.httpStatus, json: ["ok": false, "error": failure.logReason],
                      request: request, isWebDAV: false, forceClose: true)
             return
         }
@@ -1837,9 +1837,13 @@ final class ROMUploadServer: @unchecked Sendable {
         let parser = StreamingMultipartParser(
             preservesSubfolders: preservesMultipartSubfolders,
             uploadTransferObserver: uploadTransferObserver,
+            onUploadResult: onUploadResult,
             boundary: boundary,
             outputDirectory: uploadDirectory(for: request),
-            onFileCompleted: { [weak self] path in self?.postUploadCompleted(filePath: path) }
+            onFileCompleted: { [weak self] path in
+                self?.invalidatePropfindCache()
+                self?.postUploadCompleted(filePath: path)
+            }
         )
         parser.feed(body)
         parser.finalize { [weak self] in
@@ -1945,28 +1949,16 @@ final class ROMUploadServer: @unchecked Sendable {
 
     private typealias PutFinish = (_ failure: UploadFailure?) -> Void
 
-    /// Finish a streaming PUT. On writer failure or truncation, delete the partial file, log,
-    /// and hand the failure to `finish` WITHOUT posting the completion notification.
-    private func completeStreamingPut(writer: SerialFileWriter, target: URL,
-                                      truncated: Bool, finish: @escaping PutFinish) {
-        writer.finalize { [weak self] in
-            guard let self else { return }
-            if let failure = UploadFailure.classify(writer: writer, truncated: truncated) {
-                WebServerLog.log(.error, "upload FAILED for \(target.lastPathComponent): \(failure.logReason) after \(writer.bytesWritten) bytes — deleting partial file")
-                try? FileManager.default.removeItem(at: target)
-                finish(failure)
-                return
+    private func completePut(_ upload: StagedUpload, failure: UploadFailure? = nil,
+                             overwrite: Bool, finish: @escaping PutFinish) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let discard = Self.isMetadataSidecar(upload.destination)
+            let result = upload.finish(failure: failure, overwrite: overwrite, discard: discard)
+            if result == nil, !discard {
+                self.invalidatePropfindCache()
+                self.postUploadCompleted(filePath: upload.destination.path)
             }
-            if Self.isMetadataSidecar(target) {
-                // Finder insists on writing these and treats a refusal as a failed copy, so the
-                // PUT is accepted and the file dropped. Nothing announces it, so the library
-                // never rescans for it.
-                try? FileManager.default.removeItem(at: target)
-                finish(nil)
-                return
-            }
-            self.postUploadCompleted(filePath: target.path)
-            finish(nil)
+            finish(result)
         }
     }
 
@@ -1993,7 +1985,7 @@ final class ROMUploadServer: @unchecked Sendable {
     }
 
     /// Answers 201 for a new file and 204 for a replaced one (RFC 4918 §9.7.1). Finder treats the
-    /// two alike, but `overwrote` has to be read before `openPutTarget` removes the old file.
+    /// two alike. `overwrote` describes the destination when the request was accepted.
     private func webDAVPutFinish(on connection: NWConnection, request: HTTPRequest, overwrote: Bool) -> PutFinish {
         return { [weak self] failure in
             guard let self else { return }
@@ -2036,71 +2028,21 @@ final class ROMUploadServer: @unchecked Sendable {
         invalidatePropfindCache()
         guard let target = resolvePutTarget(on: connection, request: request, isWebDAV: isWebDAV) else { return }
         let overwrote = isExistingFile(target)
-        guard let writer = openPutTarget(target, on: connection, request: request, isWebDAV: isWebDAV) else { return }
+        guard let upload = openPutTarget(target, on: connection, request: request, isWebDAV: isWebDAV) else { return }
         postUploadStarted(path: target.path)
-        writer.write(initialBody)
-        streamPutChunks(on: connection, writer: writer, target: target, remaining: remaining,
+        upload.write(initialBody)
+        streamPutChunks(on: connection, upload: upload, remaining: remaining,
+                        overwrite: !isWebDAV || webDAVOverwriteAllowed(request),
                         finish: putFinish(on: connection, request: request, isWebDAV: isWebDAV, overwrote: overwrote))
     }
 
-    private enum PutTargetOpen {
-        case writer(SerialFileWriter)
-        /// The target exists and is a directory. RFC 4918 §9.7.2: answer 405, never clobber it.
-        case isDirectory
-        case failed
-    }
-
-    /// Creates the parent directory, replaces any existing FILE (createFile does not truncate,
-    /// and preallocating over an existing file is slow on APFS), and opens the writer.
-    ///
-    /// The directory check happens before any filesystem mutation: this used to remove whatever
-    /// sat at the target, so a `PUT` onto an existing folder recursively deleted it and every
-    /// ROM inside. A rejected request now leaves the filesystem untouched.
-    private func openPutTarget(_ target: URL) -> PutTargetOpen {
-        let fm = FileManager.default
-        var isDir: ObjCBool = false
-        if fm.fileExists(atPath: target.path, isDirectory: &isDir), isDir.boolValue {
-            WebServerLog.log(.warning, "PUT: refusing to overwrite the directory \(target.lastPathComponent)")
-            return .isDirectory
-        }
-        do {
-            try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-        } catch {
-            WebServerLog.log(.error, "PUT: cannot create parent for \(target.lastPathComponent): \(error)")
-            return .failed
-        }
-        if fm.fileExists(atPath: target.path) { try? fm.removeItem(at: target) }
-        guard let writer = SerialFileWriter(at: target, transfer: uploadTransferObserver?()) else {
-            WebServerLog.log(.error, "PUT: cannot open \(target.path) for writing")
-            return .failed
-        }
-        return .writer(writer)
-    }
-
-    /// Open + canned error answer, in the shape this client expects, shared by all four PUT
-    /// paths (WebDAV streamed / chunked / buffered, and the browser's `PUT /files/…`).
     private func openPutTarget(_ target: URL, on connection: NWConnection,
-                               request: HTTPRequest, isWebDAV: Bool) -> SerialFileWriter? {
-        switch openPutTarget(target) {
-        case .writer(let writer):
-            return writer
-        case .isDirectory:
-            if isWebDAV {
-                sendWebDAVResponse(on: connection, status: 405, statusText: "Method Not Allowed",
-                                   body: "Target is a collection", request: request, forceClose: true)
-            } else {
-                sendJSON(on: connection, status: 405, json: ["ok": false, "error": "Target is a folder"],
-                         request: request, isWebDAV: false, forceClose: true)
-            }
-            return nil
-        case .failed:
-            if isWebDAV {
-                sendWebDAVResponse(on: connection, status: 500, statusText: "Internal Server Error",
-                                   body: "Cannot create file", request: request, forceClose: true)
-            } else {
-                sendJSON(on: connection, status: 500, json: ["ok": false, "error": "Cannot create file"],
-                         request: request, isWebDAV: false, forceClose: true)
-            }
+                               request: HTTPRequest, isWebDAV: Bool) -> StagedUpload? {
+        switch StagedUpload.open(at: target, observer: uploadTransferObserver, onResult: onUploadResult) {
+        case .success(let upload):
+            return upload
+        case .failure(let failure):
+            putFinish(on: connection, request: request, isWebDAV: isWebDAV, overwrote: false)(failure)
             return nil
         }
     }
@@ -2136,34 +2078,23 @@ final class ROMUploadServer: @unchecked Sendable {
                  : browserPutFinish(on: connection, request: request)
     }
 
-    private func sendPutBadRequest(on connection: NWConnection, request: HTTPRequest,
-                                   isWebDAV: Bool, reason: String) {
-        if isWebDAV {
-            sendWebDAVResponse(on: connection, status: 400, statusText: "Bad Request",
-                               body: reason, request: request, forceClose: true)
-        } else {
-            sendJSON(on: connection, status: 400, json: ["ok": false, "error": reason],
-                     request: request, isWebDAV: false, forceClose: true)
-        }
-    }
-
-    private func streamPutChunks(on connection: NWConnection, writer: SerialFileWriter,
-                                 target: URL, remaining: Int, finish: @escaping PutFinish) {
+    private func streamPutChunks(on connection: NWConnection, upload: StagedUpload,
+                                 remaining: Int, overwrite: Bool, finish: @escaping PutFinish) {
         if remaining <= 0 {
-            completeStreamingPut(writer: writer, target: target, truncated: false, finish: finish)
+            completePut(upload, overwrite: overwrite, finish: finish)
             return
         }
         connection.receive(minimumIncompleteLength: 1,
                            maximumLength: min(remaining, Self.readChunkSize)) { [weak self] data, _, isComplete, error in
             guard let self else { return }
-            if let data, !data.isEmpty { writer.write(data) }
+            if let data, !data.isEmpty { upload.write(data) }
             let newRemaining = remaining - (data?.count ?? 0)
             if newRemaining <= 0 || isComplete || error != nil {
-                self.completeStreamingPut(writer: writer, target: target,
-                                          truncated: newRemaining > 0, finish: finish)
+                self.completePut(upload, failure: newRemaining > 0 ? .truncated : nil,
+                                 overwrite: overwrite, finish: finish)
             } else {
-                self.streamPutChunks(on: connection, writer: writer, target: target,
-                                     remaining: newRemaining, finish: finish)
+                self.streamPutChunks(on: connection, upload: upload,
+                                     remaining: newRemaining, overwrite: overwrite, finish: finish)
             }
         }
     }
@@ -2852,11 +2783,11 @@ final class ROMUploadServer: @unchecked Sendable {
         }
         guard !webDAVPutIsRefused(on: connection, request: request, target: target) else { return }
         let overwrote = isExistingFile(target)
-        guard let writer = openPutTarget(target, on: connection, request: request, isWebDAV: true) else { return }
+        guard let upload = openPutTarget(target, on: connection, request: request, isWebDAV: true) else { return }
         postUploadStarted(path: target.path)
-        writer.write(body)
-        completeStreamingPut(writer: writer, target: target, truncated: false,
-                            finish: webDAVPutFinish(on: connection, request: request, overwrote: overwrote))
+        upload.write(body)
+        completePut(upload, overwrite: webDAVOverwriteAllowed(request),
+                    finish: webDAVPutFinish(on: connection, request: request, overwrote: overwrote))
     }
 
     // MARK: - Upload Notifications
@@ -3086,6 +3017,7 @@ final class ROMUploadServer: @unchecked Sendable {
     // MARK: - Path Safety
 
     private func resolvedPath(_ rawPath: String, within baseDir: URL) -> URL? {
+        guard !rawPath.split(separator: "/").contains(where: { $0.hasPrefix(StagedUpload.stagingPrefix) }) else { return nil }
         switch WebServerPathSafety.resolve(rawPath, within: baseDir) {
         case .ok(let url):
             return url
@@ -3314,45 +3246,41 @@ struct HTTPRequest {
 // MARK: - Streaming Multipart Parser
 
 final class StreamingMultipartParser: @unchecked Sendable {
-    /// Every field below is confined to this serial queue. `feed`/`finalize`/`abort` hop onto
-    /// it (async — never sync, the writer completion runs here too and would deadlock), and
-    /// `SerialFileWriter.finalize`'s completion, which lands on a global queue, hops back onto
-    /// it before touching `completedFiles` / `hadWriteError` / `pendingCloses`.
+    /// All parser state and part completion stay on this serial queue.
     private let queue = DispatchQueue(
         label: "org.dolphin.iCube.uploadserver.multipart.\(UUID().uuidString)",
         qos: .utility
     )
     private let boundary: Data
-    private let endBoundary: Data
+    private let partDelimiter: Data
     private let outputDirectory: URL
     private let onFileCompleted: ((String) -> Void)?
     private let preservesSubfolders: Bool
     private let uploadTransferObserver: (@Sendable () -> (any UploadTransfer)?)?
+    private let onUploadResult: (@Sendable (UploadResult) -> Void)?
     private var buffer = Data()
     private var state: ParserState = .seekingBoundary
-    private var currentFilename: String?
-    private var currentWriter: SerialFileWriter?
-    private var currentFilePath: URL?
+    private var currentUpload: StagedUpload?
     /// Read only from inside `finalize`'s completion, which runs on `queue`.
     private(set) var completedFiles: [String] = []
-    /// True once any part failed to open or write, or the body was truncated. The caller must
-    /// answer 5xx. Read only from inside `finalize`'s completion, which runs on `queue`.
-    private(set) var hadWriteError = false
-    private var pendingCloses = 0
-    private var finalizeCompletion: (() -> Void)?
-    private var truncated = false
+    private(set) var failure: UploadFailure?
+    var hadWriteError: Bool { failure != nil }
 
     private let headerEndMarker = Data([0x0D, 0x0A, 0x0D, 0x0A])
+    private let newLine = Data([0x0D, 0x0A])
+    private let finalSuffix = Data("--".utf8)
 
     private enum ParserState { case seekingBoundary, readingHeaders, readingBody, done }
 
     init(preservesSubfolders: Bool = false,
          uploadTransferObserver: (@Sendable () -> (any UploadTransfer)?)? = nil,
+         onUploadResult: (@Sendable (UploadResult) -> Void)? = nil,
          boundary: String, outputDirectory: URL, onFileCompleted: ((String) -> Void)? = nil) {
         self.preservesSubfolders = preservesSubfolders
         self.uploadTransferObserver = uploadTransferObserver
+        self.onUploadResult = onUploadResult
         self.boundary = Data("--\(boundary)".utf8)
-        self.endBoundary = Data("--\(boundary)--".utf8)
+        self.partDelimiter = Data("\r\n--\(boundary)".utf8)
         self.outputDirectory = outputDirectory
         self.onFileCompleted = onFileCompleted
     }
@@ -3378,28 +3306,22 @@ final class StreamingMultipartParser: @unchecked Sendable {
         }
     }
 
-    /// The transport ended before the closing boundary. Anything still open is a partial file:
-    /// `finalize` must delete it and report failure rather than announce a completed upload.
-    /// Sets `hadWriteError` directly so a truncation with no part open is still a 500 and not a
-    /// 400 "no files uploaded".
+    /// The transport ended before the announced body length.
     func abort() {
         queue.async { [self] in
-            truncated = true
-            hadWriteError = true
+            closeCurrentFile(failure: .truncated)
+            failure = failure ?? .truncated
         }
     }
 
-    /// `completion` runs on `queue`, after every part's writer has closed, so the caller sees a
-    /// settled `completedFiles` / `hadWriteError`.
+    /// A file part is complete only after its delimiter and suffix arrive.
     func finalize(completion: @escaping () -> Void) {
         queue.async { [self] in
-            if state == .readingBody { flushBodyBuffer(isFinal: true) }
-            closeCurrentFile()
-            if pendingCloses == 0 {
-                completion()
-            } else {
-                finalizeCompletion = completion
+            if state != .done {
+                closeCurrentFile(failure: .invalidBody)
+                failure = failure ?? .invalidBody
             }
+            completion()
         }
     }
 
@@ -3407,123 +3329,80 @@ final class StreamingMultipartParser: @unchecked Sendable {
         while true {
             switch state {
             case .seekingBoundary:
-                guard let range = buffer.findRange(of: boundary) else { return }
-                let afterBoundary = range.upperBound
-                guard afterBoundary + 2 <= buffer.endIndex else { return }
-                if buffer[afterBoundary...].starts(with: Data("--".utf8)) { state = .done; return }
-                buffer = Data(buffer[afterBoundary...])
-                if buffer.starts(with: Data([0x0D, 0x0A])) { buffer = Data(buffer.dropFirst(2)) }
+                guard let range = buffer.findRange(of: boundary),
+                      range.upperBound + 2 <= buffer.endIndex else { return }
+                let suffix = buffer[range.upperBound...]
+                if suffix.starts(with: finalSuffix) { state = .done; return }
+                guard suffix.starts(with: newLine) else { return }
+                buffer = Data(suffix.dropFirst(2))
                 state = .readingHeaders
 
             case .readingHeaders:
                 guard let headerEnd = buffer.findRange(of: headerEndMarker) else { return }
                 let headersData = buffer[buffer.startIndex..<headerEnd.lowerBound]
                 buffer = Data(buffer[headerEnd.upperBound...])
-
-                let headersStr = String(data: headersData, encoding: .utf8) ?? ""
-                currentFilename = extractFilename(from: headersStr)
-
-                if let filename = currentFilename, !filename.isEmpty {
-                    guard let sanitized = Self.sanitizedRelativePath(filename, preservesSubfolders: preservesSubfolders) else {
-                        currentFilename = nil
-                        state = .readingBody
-                        continue
-                    }
-                    // The sanitizer only sees the name. This also refuses a symlink inside the
-                    // upload folder, as a parent or as the file itself, that points outside it.
-                    guard case let .ok(filePath) = WebServerPathSafety.resolve(sanitized, within: outputDirectory) else {
-                        WebServerLog.log(.warning, "multipart: refused \(sanitized), it resolves outside the upload folder")
-                        currentFilename = nil
-                        state = .readingBody
-                        continue
-                    }
-                    currentFilename = sanitized
-                    currentFilePath = filePath
-                    try? FileManager.default.createDirectory(at: filePath.deletingLastPathComponent(),
-                                                             withIntermediateDirectories: true)
-                    currentWriter = SerialFileWriter(at: filePath, transfer: uploadTransferObserver?())
-                    if currentWriter == nil {
-                        WebServerLog.log(.error, "multipart: cannot open \(filePath.path) for writing")
-                        hadWriteError = true
-                        currentFilename = nil
-                        currentFilePath = nil
-                    }
-                    NotificationCenter.default.post(
-                        name: Notification.Name(PVWebServerFileUploadStartedNotificationName),
-                        object: nil, userInfo: ["path": filePath.path]
-                    )
-                }
+                openPart(headers: String(decoding: headersData, as: UTF8.self))
                 state = .readingBody
 
             case .readingBody:
-                flushBodyBuffer(isFinal: false)
-                if state != .readingBody { continue }
-                return
+                if !finishPartIfDelimited() { return }
 
             case .done:
+                buffer.removeAll()
                 return
             }
         }
     }
 
-    private func flushBodyBuffer(isFinal: Bool) {
-        if let range = buffer.findRange(of: boundary) {
-            var endIdx = range.lowerBound
-            if endIdx >= 2 {
-                let crlfCheck = buffer[endIdx - 2 ..< endIdx]
-                if crlfCheck == Data([0x0D, 0x0A]) { endIdx -= 2 }
-            }
-            let bodyChunk = buffer[buffer.startIndex..<endIdx]
-            currentWriter?.write(bodyChunk)
-            closeCurrentFile()
-
-            buffer = Data(buffer[range.upperBound...])
-            if buffer.starts(with: Data("--".utf8)) {
-                state = .done
-            } else {
-                if buffer.starts(with: Data([0x0D, 0x0A])) { buffer = Data(buffer.dropFirst(2)) }
-                state = .readingHeaders
-            }
-        } else if isFinal {
-            if !buffer.isEmpty { currentWriter?.write(buffer); buffer = Data() }
-            closeCurrentFile()
-        } else {
-            let safeSize = boundary.count + 4
-            if buffer.count > safeSize {
-                let writeCount = buffer.count - safeSize
-                let chunk = buffer[buffer.startIndex..<buffer.index(buffer.startIndex, offsetBy: writeCount)]
-                currentWriter?.write(chunk)
-                buffer = Data(buffer[buffer.index(buffer.startIndex, offsetBy: writeCount)...])
-            }
+    private func openPart(headers: String) {
+        guard let filename = extractFilename(from: headers),
+              let sanitized = Self.sanitizedRelativePath(filename, preservesSubfolders: preservesSubfolders),
+              case .ok(let path) = WebServerPathSafety.resolve(sanitized, within: outputDirectory) else { return }
+        switch StagedUpload.open(at: path, observer: uploadTransferObserver, onResult: onUploadResult) {
+        case .success(let upload):
+            currentUpload = upload
+            NotificationCenter.default.post(
+                name: Notification.Name(PVWebServerFileUploadStartedNotificationName),
+                object: nil, userInfo: ["path": path.path]
+            )
+        case .failure(let reason):
+            failure = failure ?? reason
         }
     }
 
-    private func closeCurrentFile() {
-        guard let writer = currentWriter else { return }
-        let path = currentFilePath?.path
-        let filename = currentFilename
-        currentWriter = nil
-        currentFilename = nil
-        currentFilePath = nil
-        pendingCloses += 1
-        writer.finalize { [weak self] in
-            guard let self else { return }
-            // Hops back onto the parser queue: `SerialFileWriter` calls this on a global queue,
-            // and the fields below are also touched by `feed`/`finalize`.
-            self.queue.async {
-                if writer.failed || self.truncated {
-                    self.hadWriteError = true
-                    if let path { try? FileManager.default.removeItem(atPath: path) }
-                } else if let path, filename != nil {
-                    self.completedFiles.append(path)
-                    self.onFileCompleted?(path)
-                }
-                self.pendingCloses -= 1
-                if self.pendingCloses == 0, let completion = self.finalizeCompletion {
-                    self.finalizeCompletion = nil
-                    completion()
-                }
+    private func finishPartIfDelimited() -> Bool {
+        var searchStart = buffer.startIndex
+        while let range = buffer.range(of: partDelimiter, in: searchStart..<buffer.endIndex) {
+            let suffix = buffer[range.upperBound...]
+            guard suffix.count >= 2 else { break }
+            let isLast = suffix.starts(with: finalSuffix)
+            if isLast || suffix.starts(with: newLine) {
+                currentUpload?.write(buffer[buffer.startIndex..<range.lowerBound])
+                closeCurrentFile()
+                buffer = Data(suffix.dropFirst(2))
+                state = isLast ? .done : .readingHeaders
+                return true
             }
+            searchStart = range.lowerBound + 1
+        }
+        // Retain enough bytes for a delimiter and its two-byte suffix split across reads.
+        let writeCount = buffer.count - partDelimiter.count - 2
+        if writeCount > 0 {
+            currentUpload?.write(buffer.prefix(writeCount))
+            buffer = Data(buffer.dropFirst(writeCount))
+        }
+        return false
+    }
+
+    private func closeCurrentFile(failure inputFailure: UploadFailure? = nil) {
+        guard let upload = currentUpload else { return }
+        currentUpload = nil
+        if let reason = upload.finish(failure: inputFailure) {
+            failure = failure ?? reason
+        } else {
+            let path = upload.destination.path
+            completedFiles.append(path)
+            onFileCompleted?(path)
         }
     }
 
