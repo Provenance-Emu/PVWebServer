@@ -16,6 +16,19 @@ final class WebServerConfigurationTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testConfiguredBonjourNameSkipsHostNameResolution() {
+        let name = PVWebServer.resolveBonjourName("Configured", title: "Test") {
+            XCTFail("A configured Bonjour name must not trigger hostname resolution")
+            return "device.local"
+        }
+        XCTAssertEqual(name, "Configured")
+    }
+
+    func testDefaultBonjourNameUsesHostNameWhenAvailable() {
+        XCTAssertEqual(PVWebServer.resolveBonjourName(nil, title: "Test") { "device.local" }, "Test (device)")
+        XCTAssertEqual(PVWebServer.resolveBonjourName(nil, title: "Test") { "" }, "Test")
+    }
+
     private func start(
         defaultUpload: String? = nil,
         reportsMoves: Bool = true

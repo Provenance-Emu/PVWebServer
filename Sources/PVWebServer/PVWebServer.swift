@@ -118,8 +118,9 @@ public final class PVWebServer: NSObject, @unchecked Sendable {
             ?? "iCube"
         self.server.pageTitle = title
         // Unique per device so two iCubes on one LAN do not collide on the Bonjour name.
-        let host = ProcessInfo.processInfo.hostName.replacingOccurrences(of: ".local", with: "")
-        self.server.bonjourName = configuration.bonjourName ?? (host.isEmpty ? title : "\(title) (\(host))")
+        self.server.bonjourName = Self.resolveBonjourName(configuration.bonjourName, title: title) {
+            ProcessInfo.processInfo.hostName
+        }
         self.server.defaultUploadDirectory = configuration.defaultUploadDirectory
         self.server.reportsWebDAVMovesAsUploads = configuration.reportsWebDAVMovesAsUploads
         self.server.advertisesWebDAVService = configuration.advertisesWebDAVService
@@ -144,6 +145,13 @@ public final class PVWebServer: NSObject, @unchecked Sendable {
             name: Notification.Name(PVWebServerFileUploadCompletedNotificationName),
             object: nil
         )
+    }
+
+    static func resolveBonjourName(_ configuredName: String?, title: String, hostName: () -> String) -> String {
+        // ProcessInfo.hostName can block on name resolution during app launch.
+        if let configuredName { return configuredName }
+        let host = hostName().replacingOccurrences(of: ".local", with: "")
+        return host.isEmpty ? title : "\(title) (\(host))"
     }
 
     // MARK: Upload root directory
