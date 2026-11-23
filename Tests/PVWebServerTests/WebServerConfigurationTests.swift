@@ -27,6 +27,7 @@ final class WebServerConfigurationTests: XCTestCase {
     func testDefaultBonjourNameUsesHostNameWhenAvailable() {
         XCTAssertEqual(PVWebServer.resolveBonjourName(nil, title: "Test") { "device.local" }, "Test (device)")
         XCTAssertEqual(PVWebServer.resolveBonjourName(nil, title: "Test") { "" }, "Test")
+        XCTAssertEqual(PVWebServer.resolveBonjourName(nil, title: "Test") { "localhost" }, "Test")
     }
 
     private func start(
