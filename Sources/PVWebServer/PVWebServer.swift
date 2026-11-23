@@ -119,7 +119,7 @@ public final class PVWebServer: NSObject, @unchecked Sendable {
         self.server.pageTitle = title
         // Unique per device so two iCubes on one LAN do not collide on the Bonjour name.
         self.server.bonjourName = Self.resolveBonjourName(configuration.bonjourName, title: title) {
-            ProcessInfo.processInfo.hostName
+            Self.localHostName()
         }
         self.server.defaultUploadDirectory = configuration.defaultUploadDirectory
         self.server.reportsWebDAVMovesAsUploads = configuration.reportsWebDAVMovesAsUploads
@@ -148,10 +148,18 @@ public final class PVWebServer: NSObject, @unchecked Sendable {
     }
 
     static func resolveBonjourName(_ configuredName: String?, title: String, hostName: () -> String) -> String {
-        // ProcessInfo.hostName can block on name resolution during app launch.
         if let configuredName { return configuredName }
         let host = hostName().replacingOccurrences(of: ".local", with: "")
-        return host.isEmpty ? title : "\(title) (\(host))"
+        return host.isEmpty || host == "localhost" ? title : "\(title) (\(host))"
+    }
+
+    /// This device's own name for itself, read from the kernel. Never `ProcessInfo.hostName`: that
+    /// resolves the name over the network and can block for 20 seconds or more, and the shared
+    /// server is first touched on the main thread during launch, where iOS kills the app for it.
+    static func localHostName() -> String {
+        var buffer = [CChar](repeating: 0, count: Int(MAXHOSTNAMELEN) + 1)
+        guard gethostname(&buffer, buffer.count - 1) == 0 else { return "" }
+        return String(cString: buffer)
     }
 
     // MARK: Upload root directory
