@@ -45,6 +45,6 @@ for platform in 'iOS' 'iOS Simulator' 'tvOS' 'tvOS Simulator' \
 done
 
 xcodebuild -create-xcframework "${framework_args[@]}" -output "$scratch/PVWebServer.xcframework"
-ditto -c -k --keepParent "$scratch/PVWebServer.xcframework" "$output/PVWebServer.xcframework.zip"
+ditto -c -k --norsrc --noextattr --keepParent "$scratch/PVWebServer.xcframework" "$output/PVWebServer.xcframework.zip"
 swift package compute-checksum "$output/PVWebServer.xcframework.zip" \
     > "$output/PVWebServer.xcframework.zip.sha256"

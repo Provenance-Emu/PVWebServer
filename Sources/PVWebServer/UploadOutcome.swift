@@ -1,7 +1,7 @@
 import Foundation
 
 /// The terminal disposition of one accepted upload target.
-public enum UploadOutcome: Sendable, Equatable {
+@frozen public enum UploadOutcome: Sendable, Equatable {
     /// The complete file is now visible at the destination.
     case completed
     /// Finder metadata was accepted and discarded without publishing a file.

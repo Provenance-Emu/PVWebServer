@@ -100,7 +100,7 @@ public struct WebRouteResponse: Sendable {
     /// Bodies are either in memory (JSON, small payloads) or a reference to a
     /// file the server streams from disk. Game files run to gigabytes and must
     /// never be loaded into memory.
-    public enum Body: Sendable {
+    @frozen public enum Body: Sendable {
         case empty
         case data(Data)
         /// `length == nil` means "to the end of the file".
