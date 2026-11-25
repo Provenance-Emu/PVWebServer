@@ -5,12 +5,14 @@ import PackageDescription
 
 // A version tag resolves to the prebuilt XCFramework from that tag's GitHub release;
 // `main` always builds from source. The release workflow fills this in on the tagged
-// commit only (Scripts/set-binary-release.sh), so it stays `nil` on every branch.
+// commit only, so it stays `nil` on every branch.
 // Set PV_BUILD_FROM_SOURCE=1 to build a tagged version from source instead.
-let binaryRelease: (version: String, checksum: String)? = nil
+let binaryRelease: (version: String, checksums: [String: String])? = nil
 
-let buildFromSource = binaryRelease == nil
-    || ProcessInfo.processInfo.environment["PV_BUILD_FROM_SOURCE"] != nil
+let environment = ProcessInfo.processInfo.environment
+let buildFromSource = binaryRelease == nil || environment["PV_BUILD_FROM_SOURCE"] != nil
+// The release workflow builds the framework it publishes from a dynamic product.
+let libraryType: Product.Library.LibraryType? = environment["PV_XCFRAMEWORK_BUILD"] != nil ? .dynamic : nil
 
 let sourceTargets: [Target] = [
     // Pure-Swift target: the NWListener-based ROMUploadServer + the
@@ -38,13 +40,13 @@ let sourceTargets: [Target] = [
 ]
 
 let binaryTargets: [Target] = binaryRelease.map { release in
-    [
+    release.checksums.sorted { $0.key < $1.key }.map { module, checksum in
         .binaryTarget(
-            name: "PVWebServer",
-            url: "https://github.com/Provenance-Emu/PVWebServer/releases/download/\(release.version)/PVWebServer.xcframework.zip",
-            checksum: release.checksum
+            name: module,
+            url: "https://github.com/Provenance-Emu/PVWebServer/releases/download/\(release.version)/\(module).xcframework.zip",
+            checksum: checksum
         )
-    ]
+    }
 } ?? []
 
 let package = Package(
@@ -63,6 +65,7 @@ let package = Package(
     products: [
         .library(
             name: "PVWebServer",
+            type: buildFromSource ? libraryType : nil,
             targets: ["PVWebServer"]
         ),
         .library(
