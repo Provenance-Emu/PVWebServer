@@ -8,11 +8,11 @@
 
 import Foundation
 
-public enum WebServerLogLevel: Sendable {
+@frozen public enum WebServerLogLevel: Sendable {
     case debug, info, warning, error
 }
 
-public enum WebServerLog {
+@frozen public enum WebServerLog {
     public typealias Handler = @Sendable (WebServerLogLevel, String) -> Void
 
     private static let lock = NSLock()

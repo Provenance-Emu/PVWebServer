@@ -13,7 +13,7 @@
 //  answers "given this event, should the app-target's single owner
 //  (`WebServerLifecycleManager`) start or stop the real server?" so the
 //  decision itself is unit-testable without NWListener or a running app.
-public enum WebServerLifecycleEvent {
+@frozen public enum WebServerLifecycleEvent {
     /// The app launched or returned to the foreground (scene became active).
     case appForegrounded
     /// The app moved to the background (scene entered background).
@@ -57,7 +57,7 @@ public enum WebServerLifecycleEvent {
     case userReleasedAccess
 }
 
-public enum WebServerLifecycleAction: Equatable {
+@frozen public enum WebServerLifecycleAction: Equatable {
     case start
     case stop
     case none

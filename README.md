@@ -93,15 +93,20 @@ The original GPL-2.0-or-later source notices are retained; see COPYING.
 
 ## Precompiled XCFramework
 
-Version tags trigger the release workflow. The GitHub Release includes
-`PVWebServer.xcframework.zip` and its SwiftPM checksum. The dynamic framework
+A version tag resolves to a prebuilt XCFramework: the tag's `Package.swift` is a
+`binaryTarget` pointing at `PVWebServer.xcframework.zip` in that tag's GitHub Release.
+An app that depends on a version compiles none of this package. The dynamic framework
 contains the Swift module and web templates for iOS, tvOS, watchOS, visionOS
 (devices and simulators), macOS, and Mac Catalyst.
 
-For direct Xcode integration, unzip the XCFramework and add it to the app
-target with **Embed & Sign**. Import the module as `PVWebServer`. To build
-assets for an existing tag, run **Release XCFramework** from the Actions tab
-and enter the tag.
+`main` and every other branch build from source. To build a tagged version from source
+(to step into it in the debugger, say), set `PV_BUILD_FROM_SOURCE=1` in the environment
+`xcodebuild` or Xcode starts in, then resolve packages again.
+
+To release, run **Release XCFramework** from the Actions tab with the new version. It
+builds the framework from `main`, then tags a commit whose only change is the release's
+checksum in `Package.swift`; that commit is on no branch. Do not push version tags by
+hand: such a tag has no binary and builds from source.
 
 The first all-platform binary release must use a tag that includes the
 watchOS build fix. The 1.1.0 source tag predates that fix.

@@ -11,9 +11,9 @@ import Foundation
 /// Resolves a client-supplied relative path against a base directory and rejects any path
 /// that escapes the sandbox — lexically (`..`) OR via an on-disk symlink. Public so routes an
 /// app registers with `addAsyncHandler` apply the same guard as the built-in handlers.
-public enum WebServerPathSafety {
+@frozen public enum WebServerPathSafety {
 
-    public enum Resolution: Equatable {
+    @frozen public enum Resolution: Equatable {
         /// Path is safely inside the sandbox; carries the (lexically-standardized) URL.
         case ok(URL)
         /// `.`/`..` collapsing lands the path outside the base directory.
